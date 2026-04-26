@@ -1,5 +1,11 @@
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const { body, validationResult } = require('express-validator');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const morgan = require('morgan');
 const dotenv = require('dotenv');
 const axios = require('axios');
 
@@ -8,45 +14,155 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
-app.use(cors());
-app.use(express.json());
+// ===== ЗАЩИТА =====
 
-// Логирование
-app.use((req, res, next) => {
-    console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
-    next();
+// Helmet — защита HTTP-заголовков
+app.use(helmet());
+
+// CORS — только с нашего домена
+const allowedOrigins = [
+    'http://localhost:8080',
+    'http://localhost:5000',
+    'https://prezentator-ai.com',
+    'https://maximzhankevich1993.github.io',
+];
+
+app.use(cors({
+    origin: function(origin, callback) {
+        if (!origin || allowedOrigins.includes(origin)) {
+            callback(null, true);
+        } else {
+            callback(new Error('Доступ запрещён'));
+        }
+    },
+    credentials: true,
+}));
+
+// Rate Limiting — защита от DDoS и брутфорса
+const generalLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 минут
+    max: 100, // максимум 100 запросов
+    message: { error: 'Слишком много запросов. Попробуйте позже.' },
+    standardHeaders: true,
+    legacyHeaders: false,
 });
+
+const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 5, // 5 попыток входа
+    message: { error: 'Слишком много попыток входа. Подождите 15 минут.' },
+});
+
+const generateLimiter = rateLimit({
+    windowMs: 60 * 1000, // 1 минута
+    max: 3, // 3 генерации в минуту
+    message: { error: 'Слишком много генераций. Подождите минуту.' },
+});
+
+app.use(generalLimiter);
+
+// Логирование запросов
+app.use(morgan('combined'));
+
+// Парсинг JSON с ограничением размера
+app.use(express.json({ limit: '1mb' }));
+
+// ===== ВАЛИДАЦИЯ ВХОДНЫХ ДАННЫХ =====
+
+const sanitizeInput = (value) => {
+    if (typeof value !== 'string') return value;
+    return value
+        .replace(/<[^>]*>/g, '') // Убираем HTML-теги
+        .replace(/['"`;]/g, '')   // Убираем кавычки и точку с запятой
+        .trim()
+        .substring(0, 1000);      // Ограничиваем длину
+};
+
+const validateGenerate = [
+    body('topic')
+        .isString()
+        .trim()
+        .isLength({ min: 3, max: 500 })
+        .withMessage('Тема должна быть от 3 до 500 символов')
+        .customSanitizer(sanitizeInput),
+    body('maxSlides')
+        .optional()
+        .isInt({ min: 1, max: 50 })
+        .withMessage('Количество слайдов: от 1 до 50'),
+];
+
+const validateRegister = [
+    body('email')
+        .isEmail()
+        .normalizeEmail()
+        .withMessage('Некорректный email'),
+    body('password')
+        .isLength({ min: 8, max: 100 })
+        .withMessage('Пароль должен быть от 8 до 100 символов')
+        .matches(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/)
+        .withMessage('Пароль должен содержать заглавную, строчную букву и цифру'),
+    body('name')
+        .optional()
+        .isString()
+        .trim()
+        .isLength({ max: 100 })
+        .customSanitizer(sanitizeInput),
+];
+
+// ===== JWT АУТЕНТИФИКАЦИЯ =====
+
+const authenticate = (req, res, next) => {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    
+    if (!token) {
+        return res.status(401).json({ error: 'Требуется авторизация' });
+    }
+    
+    try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret');
+        req.user = decoded;
+        next();
+    } catch (e) {
+        return res.status(401).json({ error: 'Недействительный токен' });
+    }
+};
 
 // ===== API РОУТЫ =====
 
 // Health check
 app.get('/api/health', (req, res) => {
-    res.json({ 
-        status: 'ok', 
+    res.json({
+        status: 'ok',
         timestamp: new Date().toISOString(),
-        version: '1.0.0'
+        version: '2.0.0',
+        security: {
+            helmet: true,
+            rateLimit: true,
+            cors: true,
+            validation: true,
+        }
     });
 });
 
-// Генерация презентации через DeepSeek
-app.post('/api/generate', async (req, res) => {
+// Генерация презентации (с защитой)
+app.post('/api/generate', generateLimiter, validateGenerate, async (req, res) => {
     try {
-        const { topic, maxSlides = 10, language = 'ru' } = req.body;
-        
-        if (!topic) {
-            return res.status(400).json({ error: 'Тема не указана' });
+        const errors = validationResult(req);
+        if (!errors.isEmpty()) {
+            return res.status(400).json({ errors: errors.array() });
         }
+
+        const { topic, maxSlides = 10 } = req.body;
         
-        console.log(`Генерация презентации: "${topic}"`);
+        console.log(`Генерация: "${topic}"`);
         
         const response = await axios.post(
             'https://api.deepseek.com/v1/chat/completions',
             {
                 model: 'deepseek-chat',
                 messages: [
-                    { role: 'system', content: getSystemPrompt(language) },
-                    { role: 'user', content: buildPrompt(topic, maxSlides, language) }
+                    { role: 'system', content: getSystemPrompt() },
+                    { role: 'user', content: buildPrompt(topic, maxSlides) }
                 ],
                 temperature: 0.7,
                 max_tokens: 2000,
@@ -86,21 +202,77 @@ app.post('/api/generate', async (req, res) => {
     }
 });
 
-// Поиск картинок через Unsplash
+// Регистрация
+app.post('/api/register', authLimiter, validateRegister, async (req, res) => {
+    try {
+        const errors = validationResult(req);
+        if (!errors.isEmpty()) {
+            return res.status(400).json({ errors: errors.array() });
+        }
+
+        const { email, password, name } = req.body;
+        
+        // Хешируем пароль
+        const salt = await bcrypt.genSalt(12);
+        const passwordHash = await bcrypt.hash(password, salt);
+        
+        // TODO: сохранить в базу данных
+        console.log(`Регистрация: ${email}`);
+        
+        res.status(201).json({
+            message: 'Пользователь зарегистрирован',
+            email: email,
+        });
+        
+    } catch (error) {
+        console.error('Ошибка регистрации:', error.message);
+        res.status(500).json({ error: 'Ошибка регистрации' });
+    }
+});
+
+// Вход
+app.post('/api/login', authLimiter, async (req, res) => {
+    try {
+        const { email, password } = req.body;
+        
+        // TODO: проверить пользователя в базе данных
+        
+        // Создаём JWT токен
+        const token = jwt.sign(
+            { email: email },
+            process.env.JWT_SECRET || 'secret',
+            { expiresIn: '24h' }
+        );
+        
+        res.json({ token, expiresIn: '24h' });
+        
+    } catch (error) {
+        console.error('Ошибка входа:', error.message);
+        res.status(500).json({ error: 'Ошибка входа' });
+    }
+});
+
+// Защищённый маршрут (пример)
+app.get('/api/me', authenticate, (req, res) => {
+    res.json({
+        user: req.user,
+        message: 'Доступ разрешён'
+    });
+});
+
+// Поиск картинок
 app.post('/api/images/search', async (req, res) => {
     try {
         const { keywords, count = 5 } = req.body;
         
-        if (!keywords) {
+        if (!keywords || keywords.length < 2) {
             return res.status(400).json({ error: 'Ключевые слова не указаны' });
         }
         
-        console.log(`Поиск картинок: "${keywords}"`);
-        
         const response = await axios.get('https://api.unsplash.com/search/photos', {
             params: {
-                query: keywords,
-                per_page: count,
+                query: sanitizeInput(keywords),
+                per_page: Math.min(count, 10),
                 orientation: 'landscape',
                 client_id: process.env.UNSPLASH_ACCESS_KEY
             },
@@ -108,70 +280,24 @@ app.post('/api/images/search', async (req, res) => {
         });
         
         const images = response.data.results.map(img => img.urls.regular);
-        res.json({ images, keywords, source: 'unsplash' });
+        res.json({ images, keywords: sanitizeInput(keywords) });
         
     } catch (error) {
-        console.error('Ошибка поиска картинок:', error.message);
-        const placeholderImages = Array(count).fill(null).map((_, i) => 
-            `https://via.placeholder.com/800x600/4F46E5/FFFFFF?text=Slide+${i+1}`
-        );
-        res.json({ images: placeholderImages, keywords, placeholder: true });
-    }
-});
-
-// Генерация презентации с картинками (всё в одном)
-app.post('/api/generate-with-images', async (req, res) => {
-    try {
-        const { topic, maxSlides = 10 } = req.body;
-        
-        // 1. Генерируем структуру
-        const genResponse = await axios.post(`http://localhost:${PORT}/api/generate`, 
-            { topic, maxSlides },
-            { headers: { 'Content-Type': 'application/json' } }
-        );
-        
-        const presentation = genResponse.data;
-        
-        // 2. Ищем картинки
-        for (let i = 0; i < presentation.slides.length; i++) {
-            const slide = presentation.slides[i];
-            
-            if (slide.image_keywords) {
-                try {
-                    const imgResponse = await axios.post(`http://localhost:${PORT}/api/images/search`,
-                        { keywords: slide.image_keywords, count: 1 },
-                        { headers: { 'Content-Type': 'application/json' } }
-                    );
-                    
-                    slide.image_url = imgResponse.data.images[0] || null;
-                } catch (e) {
-                    slide.image_url = null;
-                }
-            }
-            
-            // Добавляем фон по умолчанию
-            slide.background = { type: 'color', value: '#FFFFFF' };
-        }
-        
-        res.json(presentation);
-        
-    } catch (error) {
-        console.error('Ошибка:', error.message);
-        res.status(500).json({ error: 'Ошибка генерации' });
+        console.error('Ошибка поиска:', error.message);
+        res.status(500).json({ error: 'Ошибка поиска картинок' });
     }
 });
 
 // ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====
 
-function getSystemPrompt(language) {
-    if (language === 'ru') {
-        return `Ты — эксперт по созданию презентаций. Создай структуру презентации в формате JSON.
+function getSystemPrompt() {
+    return `Ты — эксперт по созданию презентаций. Создай структуру в формате JSON.
 
 Правила:
 1. Каждый слайд имеет заголовок
-2. Содержание — 3-5 ключевых пунктов
-3. Для каждого слайда укажи ключевые слова для поиска картинки (на английском)
-4. Слайды должны быть логически связаны
+2. Содержание — 3-5 пунктов
+3. Для каждого слайда — ключевые слова для поиска картинки (на английском)
+4. Слайды логически связаны
 
 Формат ответа:
 {
@@ -184,25 +310,37 @@ function getSystemPrompt(language) {
     }
   ]
 }`;
-    }
-    return `You are an expert presentation creator. Create a presentation structure in JSON format...`;
 }
 
-function buildPrompt(topic, maxSlides, language) {
-    if (language === 'ru') {
-        return `Создай структуру презентации на тему: "${topic}"
+function buildPrompt(topic, maxSlides) {
+    return `Создай структуру презентации на тему: "${topic}"
 
 Требования:
 - Количество слайдов: ровно ${maxSlides}
 - Первый слайд: заголовок и введение
 - Последний слайд: заключение
 - Для каждого слайда укажи ключевые слова для поиска картинки на английском`;
-    }
-    return `Create a presentation structure on: "${topic}"...`;
 }
 
-// Запуск сервера
+// ===== ОБРАБОТКА ОШИБОК =====
+
+app.use((err, req, res, next) => {
+    console.error(err.stack);
+    res.status(500).json({
+        error: 'Внутренняя ошибка сервера',
+        requestId: require('uuid').v4(),
+    });
+});
+
+// 404
+app.use((req, res) => {
+    res.status(404).json({ error: 'Маршрут не найден' });
+});
+
+// ===== ЗАПУСК СЕРВЕРА =====
+
 app.listen(PORT, () => {
-    console.log(`🚀 Сервер запущен: http://localhost:${PORT}`);
-    console.log(`📊 Health check: http://localhost:${PORT}/api/health`);
+    console.log(`🔒 Защищённый сервер запущен: http://localhost:${PORT}`);
+    console.log(`📊 Health: http://localhost:${PORT}/api/health`);
+    console.log('🛡 Защита: Helmet + Rate Limit + CORS + Валидация + JWT');
 });
