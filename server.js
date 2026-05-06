@@ -12,6 +12,12 @@ app.use(helmet());
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization'] }));
 app.use(express.json({ limit: '1mb' }));
 
+// Кодировка UTF-8
+app.use((req, res, next) => {
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  next();
+});
+
 // Health check
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString(), version: '1.0.0', mode: 'test' });
@@ -27,7 +33,6 @@ app.post('/api/generate', async (req, res) => {
 
   console.log(`Тестовая генерация: "${topic}"`);
 
-  // Создаём тестовые слайды
   const slides = [];
   for (let i = 0; i < maxSlides; i++) {
     slides.push({
@@ -40,11 +45,7 @@ app.post('/api/generate', async (req, res) => {
     });
   }
 
-  const presentation = {
-    title: topic,
-    slides: slides
-  };
-
+  const presentation = { title: topic, slides: slides };
   console.log(`Сгенерировано ${slides.length} слайдов`);
   res.json(presentation);
 });
