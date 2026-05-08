@@ -1,10 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
-const dotenv = require('dotenv');
 const axios = require('axios');
-
-dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -13,48 +10,26 @@ app.use(helmet());
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization'] }));
 app.use(express.json({ limit: '1mb' }));
 
-// YandexGPT настройки
-const YANDEX_API_KEY = 'ajencn3d4uu50ovbhb05';
-const YANDEX_FOLDER_ID = 'b1gi8mre52qd4eknmlbc';
-const YANDEX_URL = 'https://llm.api.cloud.yandex.net/foundationModels/v1/completion';
+// Cohere API — ТВОЙ КЛЮЧ
+const COHERE_API_KEY = 'cohere_2tieM0pkzVnWwCshDTC8Jw1QJtSatDjh60k3Uamx0YB9aP';
+const COHERE_URL = 'https://api.cohere.ai/v2/chat';
 
 // Health check
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString(), version: '4.0.0', api: 'YandexGPT' });
-});
-
-// Тест YandexGPT
-app.get('/api/test-yandex', async (req, res) => {
-  try {
-    const response = await axios.post(
-      YANDEX_URL,
-      {
-        modelUri: `gpt://${YANDEX_FOLDER_ID}/yandexgpt/latest`,
-        completionOptions: { stream: false, temperature: 0.3, maxTokens: 500 },
-        messages: [{ role: 'user', text: 'Скажи "Привет, мир!" одним предложением.' }]
-      },
-      { headers: { 'Content-Type': 'application/json', 'Authorization': `Api-Key ${YANDEX_API_KEY}` }, timeout: 15000 }
-    );
-    res.json({ success: true, data: response.data });
-  } catch (error) {
-    console.error('Ошибка YandexGPT:', error.message);
-    if (error.response) console.error('Ответ:', JSON.stringify(error.response.data).substring(0, 500));
-    res.status(500).json({ success: false, error: error.message, details: error.response?.data || 'Нет данных' });
-  }
+  res.json({ status: 'ok', timestamp: new Date().toISOString(), version: '5.0.0', api: 'Cohere' });
 });
 
 // Генерация презентации
 app.post('/api/generate', async (req, res) => {
   try {
     const { topic, maxSlides = 5 } = req.body;
-    
     if (!topic) return res.status(400).json({ error: 'Тема не указана' });
 
-    console.log(`Генерация (YandexGPT): "${topic}"`);
+    console.log(`Генерация (Cohere): "${topic}"`);
 
     const prompt = `Создай структуру презентации на тему: "${topic}". Количество слайдов: ${maxSlides}.
 
-Верни ТОЛЬКО валидный JSON, без markdown и пояснений. Формат:
+Верни ТОЛЬКО валидный JSON, без markdown и лишнего текста. Формат:
 {
   "title": "Название презентации",
   "slides": [
@@ -66,58 +41,49 @@ app.post('/api/generate', async (req, res) => {
 }`;
 
     const response = await axios.post(
-      YANDEX_URL,
+      COHERE_URL,
       {
-        modelUri: `gpt://${YANDEX_FOLDER_ID}/yandexgpt/latest`,
-        completionOptions: { stream: false, temperature: 0.7, maxTokens: 2000 },
-        messages: [{ role: 'user', text: prompt }]
+        model: 'command',
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.7,
+        max_tokens: 2000
       },
-      { headers: { 'Content-Type': 'application/json', 'Authorization': `Api-Key ${YANDEX_API_KEY}` }, timeout: 30000 }
+      {
+        headers: {
+          'Authorization': `Bearer ${COHERE_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 30000
+      }
     );
 
-    const text = response.data.result.alternatives[0].message.text;
-    
-    // Очищаем от markdown
+    const text = response.data.message?.content?.text || response.data.text || '';
     let cleanText = text.replace(/```json\n?/g, '').replace(/```/g, '').trim();
     
-    // Исправляем незакрытые строки
-    if (!cleanText.endsWith('}')) cleanText += '}';
-    if (!cleanText.startsWith('{')) cleanText = '{' + cleanText;
-    
     const presentation = JSON.parse(cleanText);
-    
     console.log(`Сгенерировано ${presentation.slides?.length || 0} слайдов`);
     res.json(presentation);
 
   } catch (error) {
-    console.error('Ошибка YandexGPT:', error.message);
-    if (error.response) console.error('Ответ:', JSON.stringify(error.response.data).substring(0, 500));
-    
+    console.error('Ошибка:', error.message);
     // Fallback: тестовая генерация
     const slides = [];
     for (let i = 0; i < 5; i++) {
       slides.push({
         title: i === 0 ? req.body.topic : `${req.body.topic} — часть ${i + 1}`,
-        content: [
-          `Ключевой пункт ${i * 3 + 1}`,
-          `Ключевой пункт ${i * 3 + 2}`,
-          `Ключевой пункт ${i * 3 + 3}`
-        ]
+        content: [`Пункт ${i * 3 + 1}`, `Пункт ${i * 3 + 2}`, `Пункт ${i * 3 + 3}`]
       });
     }
-    console.log(`Fallback: сгенерировано ${slides.length} слайдов`);
     res.json({ title: req.body.topic, slides });
   }
 });
 
-// Поиск картинок (заглушка)
+// Поиск картинок
 app.post('/api/images/search', async (req, res) => {
   res.json({ images: [], keywords: req.body.keywords, placeholder: true });
 });
 
-// Запуск
 app.listen(PORT, () => {
-  console.log(`🚀 Сервер YandexGPT: http://localhost:${PORT}`);
+  console.log(`🚀 Сервер Cohere: http://localhost:${PORT}`);
   console.log(`📊 Health: http://localhost:${PORT}/api/health`);
-  console.log(`🧪 Тест: http://localhost:${PORT}/api/test-yandex`);
 });
