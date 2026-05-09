@@ -15,132 +15,89 @@ app.use((req, res, next) => {
 });
 
 const COHERE_API_KEY = process.env.COHERE_API_KEY || 'cohere_2tieM0pkzVnWwCshDTC8Jw1QJtSatDjh60k3Uamx0YB9aP';
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 
 // Health check
 app.get('/api/health', (req, res) => {
-    res.json({ status: 'ok', api: 'Cohere', encoding: 'utf-8', timestamp: new Date().toISOString() });
+    res.json({ 
+        status: 'ok', 
+        api: 'Cohere', 
+        encoding: 'utf-8',
+        timestamp: new Date().toISOString() 
+    });
 });
-
-// 🔧 Функция: извлечь title/content из текста Cohere
-function parseSlides(rawText) {
-    const slides = [];
-    
-    // Убираем ```json ... ``` если есть
-    let text = rawText.replace(/```json|```/g, '').trim();
-    
-    // Разбиваем на строки
-    const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-    
-    let currentSlide = null;
-    
-    for (const line of lines) {
-        // Ищем строку с "title": "..."
-        const titleMatch = line.match(/"?title"?\s*:\s*"([^"]+)"/);
-        if (titleMatch) {
-            // Если уже есть накопленный слайд — сохраняем
-            if (currentSlide) {
-                slides.push(currentSlide);
-            }
-            currentSlide = { title: titleMatch[1], content: [] };
-            continue;
-        }
-        
-        // Ищем строку с "content": "..." или "content": [...]
-        const contentStrMatch = line.match(/"?content"?\s*:\s*"([^"]+)"/);
-        if (contentStrMatch && currentSlide) {
-            currentSlide.content.push(contentStrMatch[1]);
-            continue;
-        }
-        
-        // Ищем строку вида "Пункт N" (элемент списка)
-        const bulletMatch = line.match(/"?Пункт\s*\d+"?/);
-        if (bulletMatch && currentSlide) {
-            currentSlide.content.push(line.replace(/^["']|["']$/g, '').replace(/,?\s*$/, ''));
-            continue;
-        }
-        
-        // Любая другая строка в кавычках — тоже контент
-        const anyStrMatch = line.match(/^"([^"]+)"[,]?$/);
-        if (anyStrMatch && currentSlide) {
-            currentSlide.content.push(anyStrMatch[1]);
-        }
-    }
-    
-    // Добавляем последний слайд
-    if (currentSlide) {
-        slides.push(currentSlide);
-    }
-    
-    return slides;
-}
 
 // Генерация
 app.post('/api/generate', async (req, res) => {
     try {
-        const { topic, maxSlides = 5, language = 'ru' } = req.body;
+        const { topic, maxSlides = 5 } = req.body;
         
         if (!topic) {
             return res.status(400).json({ error: 'Укажите topic' });
         }
 
-        console.log(`📝 Генерация: "${topic}" (${maxSlides} слайдов)`);
+        console.log('Generating for topic:', topic);
+        console.log('Max slides:', maxSlides);
 
-        // Чёткий промпт для Cohere
         const prompt = `Создай структуру презентации на тему "${topic}" на русском языке.
-Формат ответа — ТОЛЬКО JSON (без пояснений):
-{
-  "slides": [
-    {"title": "Заголовок слайда", "content": ["Пункт 1", "Пункт 2", "Пункт 3"]},
-    ...
-  ]
-}
-Количество слайдов: ${maxSlides}. Каждый слайд: 2-4 пункта. Пиши ТОЛЬКО JSON. Никакого текста до или после.`;
+Формат ответа - только JSON, без пояснений:
+{"slides":[{"title":"Заголовок","content":["Пункт 1","Пункт 2","Пункт 3"]}]}
+Количество слайдов: ${maxSlides}.`;
 
         const response = await axios.post(
             'https://api.cohere.ai/v1/generate',
             {
                 model: 'command',
                 prompt: prompt,
-                max_tokens: 2000,
+                max_tokens: 1500,
                 temperature: 0.7,
                 k: 0,
-                p: 0.75,
-                stop_sequences: [],
-                return_likelihoods: 'NONE'
+                p: 0.75
             },
             {
                 headers: {
                     'Authorization': `Bearer ${COHERE_API_KEY}`,
-                    'Content-Type': 'application/json; charset=utf-8'
+                    'Content-Type': 'application/json; charset=utf-8',
+                    'Accept': 'application/json'
                 },
-                timeout: 30000,
-                responseType: 'json',
-                responseEncoding: 'utf8'
+                timeout: 30000
             }
         );
 
         const rawText = response.data.generations[0].text;
-        console.log('📄 Cohere ответ:', rawText.substring(0, 300));
+        console.log('Raw response:', rawText.substring(0, 300));
 
-        // Пытаемся распарсить как JSON
+        // Парсим JSON
         let slides = [];
         try {
-            const parsed = JSON.parse(rawText);
+            const cleanJson = rawText.replace(/```json\n?|```/g, '').trim();
+            const parsed = JSON.parse(cleanJson);
             slides = parsed.slides || [];
-        } catch (jsonError) {
-            console.log('⚠️ JSON битый, парсим вручную...');
-            slides = parseSlides(rawText);
+        } catch (e) {
+            console.log('JSON parse error, using fallback');
+            // Простой парсинг
+            const lines = rawText.split('\n').filter(l => l.includes('"title"') || l.includes('"content"'));
+            let current = null;
+            for (const line of lines) {
+                const titleMatch = line.match(/"title"\s*:\s*"([^"]+)"/);
+                if (titleMatch) {
+                    if (current) slides.push(current);
+                    current = { title: titleMatch[1], content: [] };
+                }
+                const contentMatch = line.match(/"content"\s*:\s*"([^"]+)"/);
+                if (contentMatch && current) {
+                    current.content.push(contentMatch[1]);
+                }
+            }
+            if (current) slides.push(current);
         }
 
-        // Если пусто — возвращаем заглушку
+        // Заглушка если пусто
         if (slides.length === 0) {
-            slides = [
-                { title: topic, content: ['Введение', 'Основная часть', 'Заключение'] }
-            ];
+            slides = [{ title: topic, content: ['Введение', 'Основная часть', 'Заключение'] }];
         }
 
-        console.log(`✅ Слайдов: ${slides.length}`);
+        console.log('Slides generated:', slides.length);
 
         res.json({
             success: true,
@@ -150,14 +107,15 @@ app.post('/api/generate', async (req, res) => {
         });
 
     } catch (error) {
-        console.error('❌ Ошибка:', error.message);
+        console.error('Error:', error.message);
         res.status(500).json({ 
             error: 'Ошибка генерации',
-            details: error.message 
+            message: error.message 
         });
     }
 });
 
-app.listen(PORT, () => {
-    console.log(`🚀 Сервер на порту ${PORT}`);
+// Запуск сервера
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server running on port ${PORT}`);
 });
