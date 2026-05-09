@@ -1,92 +1,98 @@
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
+const dotenv = require('dotenv');
 const axios = require('axios');
 
+dotenv.config();
+
 const app = express();
+const PORT = process.env.PORT || 3000;
 
-app.use(cors({ origin: '*' }));
-app.use(express.json({ limit: '10mb' }));
+app.use(helmet());
+app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization'] }));
+app.use(express.json({ limit: '1mb' }));
 
-const COHERE_API_KEY = 'cohere_2tieM0pkzVnWwCshDTC8Jw1QJtSatDjh60k3Uamx0YB9aP';
-const PORT = process.env.PORT || 10000;
+// Используем переменные окружения или твои прямые ключи
+const YANDEX_API_KEY = process.env.YANDEX_API_KEY || 'ajencn3d4uu50ovbhb05';
+const YANDEX_FOLDER_ID = process.env.YANDEX_FOLDER_ID || 'b1gi8mre52qd4eknmlbc';
+const YANDEX_URL = 'https://llm.api.cloud.yandex.net/foundationModels/v1/completion';
 
 app.get('/api/health', (req, res) => {
-    res.json({ status: 'ok', time: new Date().toISOString() });
+  res.json({ status: 'ok', timestamp: new Date().toISOString(), version: '6.0.0', api: 'YandexGPT' });
 });
 
 app.post('/api/generate', async (req, res) => {
-    try {
-        const { topic, maxSlides = 5 } = req.body;
-        
-        if (!topic) {
-            return res.status(400).json({ error: 'Укажите topic' });
-        }
+  try {
+    const { topic, maxSlides = 5 } = req.body;
+    
+    if (!topic) return res.status(400).json({ error: 'Тема не указана' });
 
-        const slidesCount = Math.min(Math.max(parseInt(maxSlides) || 5, 1), 10);
-        
-        console.log(`Тема: "${topic}", слайдов: ${slidesCount}`);
+    console.log(`Генерация (YandexGPT): "${topic}"`);
 
-        const response = await axios.post(
-            'https://api.cohere.ai/v1/chat',
-            {
-                model: 'command',  // ← ИСПРАВЛЕНО: была command-r
-                message: `Создай структуру презентации на тему "${topic}" на русском языке.
-Ответь ТОЛЬКО JSON-массивом:
-[
-  {"title": "Заголовок", "content": ["Пункт 1", "Пункт 2", "Пункт 3"]}
-]
-Создай ровно ${slidesCount} слайдов.`,
-                temperature: 0.7,
-                max_tokens: 2000
-            },
-            {
-                headers: {
-                    'Authorization': `Bearer ${COHERE_API_KEY}`,
-                    'Content-Type': 'application/json'
-                },
-                timeout: 30000
-            }
-        );
+    const prompt = `Создай структуру презентации на тему: "${topic}". Количество слайдов: ${maxSlides}.
 
-        const rawText = response.data.text || '';
-        console.log('Ответ:', rawText.substring(0, 300));
-
-        // Парсинг JSON
-        let slides = [];
-        const jsonMatch = rawText.match(/\[[\s\S]*\]/);
-        if (jsonMatch) {
-            try {
-                slides = JSON.parse(jsonMatch[0]);
-            } catch (e) {
-                console.log('Ошибка парсинга:', e.message);
-            }
-        }
-
-        // Заглушка
-        if (!slides || slides.length === 0) {
-            slides = [
-                { title: 'Введение', content: ['Пункт 1', 'Пункт 2', 'Пункт 3'] },
-                { title: 'Основная часть', content: ['Пункт 1', 'Пункт 2', 'Пункт 3'] },
-                { title: 'Заключение', content: ['Пункт 1', 'Пункт 2', 'Пункт 3'] }
-            ];
-        }
-
-        res.json({
-            success: true,
-            topic: topic,
-            slides: slides,
-            count: slides.length
-        });
-
-    } catch (error) {
-        console.error('Ошибка:', error.message);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
+Верни ТОЛЬКО валидный JSON. Формат:
+{
+  "title": "Название презентации",
+  "slides": [
+    {
+      "title": "Заголовок слайда",
+      "content": ["Пункт 1", "Пункт 2", "Пункт 3"]
     }
+  ]
+}`;
+
+    const response = await axios.post(
+      YANDEX_URL,
+      {
+        modelUri: `gpt://${YANDEX_FOLDER_ID}/yandexgpt/latest`,
+        completionOptions: { stream: false, temperature: 0.7, maxTokens: "2000" },
+        messages: [{ role: 'user', text: prompt }]
+      },
+      { 
+        headers: { 
+          'Content-Type': 'application/json', 
+          'Authorization': `Api-Key ${YANDEX_API_KEY}` 
+        }, 
+        timeout: 30000 
+      }
+    );
+
+    const text = response.data.result.alternatives[0].message.text;
+    let cleanText = text.replace(/```json\n?/g, '').replace(/```/g, '').trim();
+    
+    const presentation = JSON.parse(cleanText);
+    
+    console.log(`Сгенерировано ${presentation.slides?.length || 0} слайдов`);
+    res.json(presentation);
+
+  } catch (error) {
+    console.error('Ошибка YandexGPT:', error.message);
+    if (error.response) console.error('Ответ:', JSON.stringify(error.response.data).substring(0, 500));
+    
+    // Fallback: тестовая генерация
+    const slides = [];
+    for (let i = 0; i < 5; i++) {
+      slides.push({
+        title: i === 0 ? req.body.topic : `${req.body.topic} — часть ${i + 1}`,
+        content: [
+          `Ключевой пункт ${i * 3 + 1}`,
+          `Ключевой пункт ${i * 3 + 2}`,
+          `Ключевой пункт ${i * 3 + 3}`
+        ]
+      });
+    }
+    console.log(`Fallback: сгенерировано ${slides.length} слайдов`);
+    res.json({ title: req.body.topic, slides });
+  }
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Сервер на порту ${PORT}`);
+app.post('/api/images/search', async (req, res) => {
+  res.json({ images: [], keywords: req.body.keywords, placeholder: true });
+});
+
+app.listen(PORT, () => {
+  console.log(`🚀 Сервер YandexGPT: http://localhost:${PORT}`);
+  console.log(`📊 Health: http://localhost:${PORT}/api/health`);
 });
