@@ -10,7 +10,13 @@ app.use(helmet());
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization'] }));
 app.use(express.json({ limit: '1mb' }));
 
-// Cohere API — ТВОЙ КЛЮЧ
+// Кодировка UTF-8 для всех ответов
+app.use((req, res, next) => {
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  next();
+});
+
+// Cohere API
 const COHERE_API_KEY = 'cohere_2tieM0pkzVnWwCshDTC8Jw1QJtSatDjh60k3Uamx0YB9aP';
 const COHERE_URL = 'https://api.cohere.ai/v2/chat';
 
@@ -51,7 +57,9 @@ app.post('/api/generate', async (req, res) => {
       {
         headers: {
           'Authorization': `Bearer ${COHERE_API_KEY}`,
-          'Content-Type': 'application/json'
+          'Content-Type': 'application/json; charset=utf-8',
+          'Accept': 'application/json; charset=utf-8',
+          'Accept-Charset': 'utf-8'
         },
         timeout: 30000
       }
