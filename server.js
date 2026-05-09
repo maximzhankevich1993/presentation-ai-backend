@@ -48,15 +48,33 @@ app.post('/api/generate', async (req, res) => {
 
     console.log(`🎯 Генерация: "${topic}"`);
 
-    const prompt = `Создай структуру презентации на тему: "${topic}". Количество слайдов: ${maxSlides}.
+    const prompt = `Ты — профессиональный дизайнер презентаций. Создай структуру презентации на тему: "${topic}".
 
-Верни ТОЛЬКО валидный JSON, без markdown. Формат:
+Количество слайдов: ${maxSlides}
+
+СТРОГИЕ ПРАВИЛА:
+1. Заголовки слайдов — раскрывают суть, НЕ вопросы. 
+   ПЛОХО: "Что такое космос?"
+   ХОРОШО: "Космос: бескрайние просторы Вселенной"
+   ХОРОШО: "Введение в космическую науку"
+
+2. Содержимое — полноценные тезисы, факты, объяснения.
+   ПЛОХО: ["Космос", "Планеты", "Звёзды"]
+   ХОРОШО: ["Космос включает всё пространство за пределами атмосферы Земли", "Во Вселенной более 100 миллиардов галактик", "Ближайшая звезда — Проксима Центавра, 4.2 световых года"]
+
+3. Структура должна быть логичной:
+   - Слайд 1: Введение в тему, определение, значимость
+   - Слайд 2-3: Основные факты, ключевая информация
+   - Слайд 4: Детали, примеры, применение
+   - Слайд 5: Выводы, заключение, перспективы
+
+Верни ТОЛЬКО валидный JSON, без markdown, без обрамления в \`\`\`json. Формат:
 {
-  "title": "Название",
+  "title": "Название презентации",
   "slides": [
     {
       "title": "Заголовок слайда",
-      "content": ["Пункт 1", "Пункт 2", "Пункт 3"]
+      "content": ["Содержательный тезис 1", "Содержательный тезис 2", "Содержательный тезис 3"]
     }
   ]
 }`;
@@ -65,8 +83,8 @@ app.post('/api/generate', async (req, res) => {
       modelUri: `gpt://${YANDEX_FOLDER_ID}/yandexgpt/latest`,
       completionOptions: { 
         stream: false, 
-        temperature: 0.7, 
-        maxTokens: "2000" 
+        temperature: 0.6, 
+        maxTokens: "3000" 
       },
       messages: [{ role: 'user', text: prompt }]
     }, { 
@@ -74,7 +92,7 @@ app.post('/api/generate', async (req, res) => {
         'Content-Type': 'application/json', 
         'Authorization': `Api-Key ${YANDEX_API_KEY}` 
       }, 
-      timeout: 30000 
+      timeout: 45000 
     });
 
     const text = response.data.result.alternatives[0].message.text;
@@ -90,12 +108,65 @@ app.post('/api/generate', async (req, res) => {
     // Fallback
     const slides = [];
     for (let i = 0; i < maxSlides; i++) {
-      slides.push({
-        title: i === 0 ? req.body.topic : `${req.body.topic} — слайд ${i + 1}`,
-        content: [`Пункт ${i * 3 + 1}`, `Пункт ${i * 3 + 2}`, `Пункт ${i * 3 + 3}`]
-      });
+      const slideNumber = i + 1;
+      if (slideNumber === 1) {
+        slides.push({
+          title: `Введение в тему: ${req.body.topic}`,
+          content: [`Обзор и ключевые понятия по теме "${req.body.topic}"`, 'Исторический контекст и развитие', 'Почему это важно сегодня']
+        });
+      } else if (slideNumber === maxSlides) {
+        slides.push({
+          title: 'Заключение и выводы',
+          content: ['Основные выводы по теме', 'Практическое применение', 'Перспективы и будущие направления']
+        });
+      } else {
+        slides.push({
+          title: `${req.body.topic} — ключевые аспекты (часть ${slideNumber})`,
+          content: [`Факт ${slideNumber * 3 - 2}: Важная информация по теме`, `Факт ${slideNumber * 3 - 1}: Детали и статистика`, `Факт ${slideNumber * 3}: Примеры из практики`]
+        });
+      }
     }
     res.json({ title: req.body.topic, slides });
+  }
+});
+
+// Улучшение текста AI
+app.post('/api/improve', async (req, res) => {
+  try {
+    const { text } = req.body;
+    if (!text) return res.status(400).json({ error: 'Текст не указан' });
+
+    console.log(`✨ Улучшение текста: "${text.substring(0, 50)}..."`);
+
+    const prompt = `Улучши следующий текст для презентации. Сделай его более профессиональным, чётким и убедительным. Сохрани исходный смысл, но улучши стиль и формулировку. Верни ТОЛЬКО улучшенный текст, без пояснений.
+
+Исходный текст: "${text}"
+
+Улучшенный текст:`;
+
+    const response = await axios.post(YANDEX_URL, {
+      modelUri: `gpt://${YANDEX_FOLDER_ID}/yandexgpt/latest`,
+      completionOptions: { 
+        stream: false, 
+        temperature: 0.5, 
+        maxTokens: "500" 
+      },
+      messages: [{ role: 'user', text: prompt }]
+    }, { 
+      headers: { 
+        'Content-Type': 'application/json', 
+        'Authorization': `Api-Key ${YANDEX_API_KEY}` 
+      }, 
+      timeout: 15000 
+    });
+
+    const improvedText = response.data.result.alternatives[0].message.text.trim();
+    console.log(`✅ Улучшено: "${improvedText.substring(0, 50)}..."`);
+    res.json({ original: text, improved: improvedText });
+
+  } catch (error) {
+    console.error('❌ Ошибка улучшения:', error.message);
+    res.json({ original: req.body.text, improved: req.body.text });
   }
 });
 
@@ -106,4 +177,6 @@ app.post('/api/images/search', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 Сервер YandexGPT запущен на порту ${PORT}`);
   console.log(`📊 Health: http://localhost:${PORT}/api/health`);
+  console.log(`📝 Generate: POST http://localhost:${PORT}/api/generate`);
+  console.log(`✨ Improve: POST http://localhost:${PORT}/api/improve`);
 });
