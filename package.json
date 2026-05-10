@@ -1,7 +1,7 @@
 {
   "name": "presentation-ai-backend",
   "version": "7.0.0",
-  "description": "Backend for Presentation AI — YandexGPT + Auth",
+  "description": "Backend for Presentation AI",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
