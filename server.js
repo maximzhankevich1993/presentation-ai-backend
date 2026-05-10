@@ -3,7 +3,7 @@ const cors = require('cors');
 const helmet = require('helmet');
 const axios = require('axios');
 const { Pool } = require('pg');
-const bcrypt = require('bcrypt');
+const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const nodemailer = require('nodemailer');
 
@@ -26,10 +26,9 @@ app.use(express.json({ limit: '1mb' }));
 // ═══════════════════════════════════════════════════════════════
 // DATABASE
 // ═══════════════════════════════════════════════════════════════
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
-});
+const pool = process.env.DATABASE_URL 
+  ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } })
+  : null;
 
 // ═══════════════════════════════════════════════════════════════
 // YANDEX GPT
@@ -39,17 +38,19 @@ const YANDEX_FOLDER_ID = process.env.YANDEX_FOLDER_ID;
 const YANDEX_URL = 'https://llm.api.cloud.yandex.net/foundationModels/v1/completion';
 
 // ═══════════════════════════════════════════════════════════════
-// EMAIL (SendGrid / SMTP)
+// EMAIL
 // ═══════════════════════════════════════════════════════════════
 const transporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST || 'smtp.sendgrid.net',
-  port: process.env.SMTP_PORT || 587,
+  port: parseInt(process.env.SMTP_PORT || '587'),
   secure: false,
   auth: {
     user: process.env.SMTP_USER || 'apikey',
-    pass: process.env.SMTP_PASS || process.env.SENDGRID_API_KEY
+    pass: process.env.SMTP_PASS || ''
   }
 });
+
+const FROM_EMAIL = process.env.FROM_EMAIL || 'noreply@presentation-ai.com';
 
 // Проверка ключей при старте
 if (!YANDEX_API_KEY || !YANDEX_FOLDER_ID) {
@@ -61,6 +62,11 @@ if (!YANDEX_API_KEY || !YANDEX_FOLDER_ID) {
 // MIDDLEWARE
 // ═══════════════════════════════════════════════════════════════
 async function authMiddleware(req, res, next) {
+  if (!pool) {
+    req.user = { id: 'demo', email: 'demo@demo.com', name: 'Demo', is_premium: true, free_generations_left: 999 };
+    return next();
+  }
+
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: 'Требуется авторизация' });
 
@@ -81,6 +87,7 @@ async function authMiddleware(req, res, next) {
     req.user = result.rows[0];
     next();
   } catch (e) {
+    console.error('Auth error:', e.message);
     res.status(500).json({ error: 'Ошибка сервера' });
   }
 }
@@ -104,6 +111,10 @@ app.get('/api/health', (req, res) => {
 
 // Регистрация
 app.post('/api/auth/register', async (req, res) => {
+  if (!pool) {
+    return res.json({ token: 'demo-token', user: { id: 'demo', email: req.body.email, name: req.body.name || 'Demo' } });
+  }
+
   try {
     const { email, password, name } = req.body;
 
@@ -115,17 +126,14 @@ app.post('/api/auth/register', async (req, res) => {
       return res.status(400).json({ error: 'Пароль должен быть минимум 6 символов' });
     }
 
-    // Проверка существующего пользователя
     const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email.toLowerCase()]);
     if (existing.rows.length > 0) {
       return res.status(409).json({ error: 'Пользователь с таким email уже существует' });
     }
 
-    // Хешируем пароль
     const passwordHash = await bcrypt.hash(password, 12);
     const verificationToken = crypto.randomBytes(32).toString('hex');
 
-    // Создаём пользователя
     const result = await pool.query(
       `INSERT INTO users (email, password_hash, name, verification_token, free_generations_left)
        VALUES ($1, $2, $3, $4, 10)
@@ -135,7 +143,6 @@ app.post('/api/auth/register', async (req, res) => {
 
     const user = result.rows[0];
 
-    // Создаём сессию
     const sessionToken = crypto.randomBytes(48).toString('hex');
     const tokenHash = crypto.createHash('sha256').update(sessionToken).digest('hex');
 
@@ -145,33 +152,16 @@ app.post('/api/auth/register', async (req, res) => {
       [user.id, tokenHash]
     );
 
-    // Отправляем приветственное письмо
     try {
       await transporter.sendMail({
-        from: `"Презентатор ИИ" <${process.env.FROM_EMAIL || 'noreply@presentation-ai.com'}>`,
+        from: `"Презентатор ИИ" <${FROM_EMAIL}>`,
         to: email,
         subject: 'Добро пожаловать в Презентатор ИИ! 🎉',
-        html: `
-          <div style="font-family: Arial; max-width: 480px; margin: 0 auto;">
-            <h2 style="color: #1DB954;">С возвращением, ${user.name}!</h2>
-            <p>Ваш аккаунт успешно создан.</p>
-            <p>🎁 Вы получили <strong>10 бесплатных генераций</strong> презентаций.</p>
-            <a href="https://presentation-ai.com" 
-               style="display: inline-block; padding: 12px 24px; background: #1DB954; color: white; text-decoration: none; border-radius: 8px; font-weight: bold;">
-              Начать создавать
-            </a>
-          </div>
-        `
+        html: `<div style="font-family:Arial;max-width:480px;margin:0 auto;"><h2 style="color:#1DB954;">Добро пожаловать, ${user.name}!</h2><p>Ваш аккаунт создан.</p><p>🎁 <strong>10 бесплатных генераций</strong> уже ждут вас.</p></div>`
       });
-    } catch (e) {
-      console.error('Email send error:', e.message);
-    }
+    } catch (e) {}
 
-    res.json({
-      token: sessionToken,
-      user: { id: user.id, email: user.email, name: user.name }
-    });
-
+    res.json({ token: sessionToken, user: { id: user.id, email: user.email, name: user.name } });
   } catch (e) {
     console.error('Register error:', e);
     res.status(500).json({ error: 'Ошибка регистрации' });
@@ -180,6 +170,10 @@ app.post('/api/auth/register', async (req, res) => {
 
 // Вход
 app.post('/api/auth/login', async (req, res) => {
+  if (!pool) {
+    return res.json({ token: 'demo-token', user: { id: 'demo', email: req.body.email, name: 'Demo', isPremium: true, freeGenerationsLeft: 999 } });
+  }
+
   try {
     const { email, password } = req.body;
 
@@ -187,7 +181,6 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(400).json({ error: 'Email и пароль обязательны' });
     }
 
-    // Ищем пользователя
     const result = await pool.query(
       'SELECT id, email, name, password_hash, is_premium, premium_expiry, free_generations_left, failed_login_attempts, locked_until FROM users WHERE email = $1',
       [email.toLowerCase()]
@@ -199,12 +192,10 @@ app.post('/api/auth/login', async (req, res) => {
 
     const user = result.rows[0];
 
-    // Проверка блокировки
     if (user.locked_until && new Date(user.locked_until) > new Date()) {
       return res.status(423).json({ error: 'Аккаунт заблокирован. Попробуйте позже.' });
     }
 
-    // Проверка пароля
     const validPassword = await bcrypt.compare(password, user.password_hash);
     if (!validPassword) {
       await pool.query(
@@ -214,34 +205,27 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Неверный email или пароль' });
     }
 
-    // Сбрасываем попытки
     await pool.query(
       'UPDATE users SET failed_login_attempts = 0, locked_until = NULL, last_login = NOW() WHERE id = $1',
       [user.id]
     );
 
-    // Создаём сессию
     const sessionToken = crypto.randomBytes(48).toString('hex');
     const tokenHash = crypto.createHash('sha256').update(sessionToken).digest('hex');
 
     await pool.query(
-      `INSERT INTO sessions (user_id, token_hash, expires_at)
-       VALUES ($1, $2, NOW() + INTERVAL '30 days')`,
+      `INSERT INTO sessions (user_id, token_hash, expires_at) VALUES ($1, $2, NOW() + INTERVAL '30 days')`,
       [user.id, tokenHash]
     );
 
     res.json({
       token: sessionToken,
       user: {
-        id: user.id,
-        email: user.email,
-        name: user.name,
-        isPremium: user.is_premium,
-        premiumExpiry: user.premium_expiry,
+        id: user.id, email: user.email, name: user.name,
+        isPremium: user.is_premium, premiumExpiry: user.premium_expiry,
         freeGenerationsLeft: user.free_generations_left
       }
     });
-
   } catch (e) {
     console.error('Login error:', e);
     res.status(500).json({ error: 'Ошибка входа' });
@@ -250,16 +234,16 @@ app.post('/api/auth/login', async (req, res) => {
 
 // Восстановление пароля
 app.post('/api/auth/forgot-password', async (req, res) => {
+  if (!pool) {
+    return res.json({ success: true, message: 'Если email зарегистрирован, ссылка отправлена' });
+  }
+
   try {
     const { email } = req.body;
-
-    if (!email) {
-      return res.status(400).json({ error: 'Email обязателен' });
-    }
+    if (!email) return res.status(400).json({ error: 'Email обязателен' });
 
     const result = await pool.query('SELECT id, name FROM users WHERE email = $1', [email.toLowerCase()]);
 
-    // Всегда возвращаем успех, чтобы не раскрывать существование email
     if (result.rows.length === 0) {
       return res.json({ success: true, message: 'Если email зарегистрирован, ссылка отправлена' });
     }
@@ -268,7 +252,6 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     const resetToken = crypto.randomBytes(32).toString('hex');
     const resetTokenHash = await bcrypt.hash(resetToken, 10);
 
-    // Сохраняем токен в отдельной таблице (создадим её)
     await pool.query(
       `CREATE TABLE IF NOT EXISTS password_resets (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -287,30 +270,15 @@ app.post('/api/auth/forgot-password', async (req, res) => {
 
     const resetLink = `https://presentation-ai.com/reset-password?token=${resetToken}&email=${encodeURIComponent(email)}`;
 
-    // Отправляем email
     await transporter.sendMail({
-      from: `"Презентатор ИИ" <${process.env.FROM_EMAIL || 'noreply@presentation-ai.com'}>`,
+      from: `"Презентатор ИИ" <${FROM_EMAIL}>`,
       to: email,
       subject: 'Восстановление пароля',
-      html: `
-        <div style="font-family: Arial; max-width: 480px; margin: 0 auto;">
-          <h2>Восстановление пароля</h2>
-          <p>Здравствуйте, ${user.name}!</p>
-          <p>Вы запросили сброс пароля. Нажмите кнопку ниже, чтобы создать новый пароль:</p>
-          <a href="${resetLink}" 
-             style="display: inline-block; padding: 14px 28px; background: #1DB954; color: white; text-decoration: none; border-radius: 8px; font-weight: bold;">
-            Сбросить пароль
-          </a>
-          <p style="color: #666; font-size: 12px; margin-top: 20px;">
-            Ссылка действительна 1 час. Если вы не запрашивали сброс, просто игнорируйте это письмо.
-          </p>
-        </div>
-      `
+      html: `<div style="font-family:Arial;max-width:480px;margin:0 auto;"><h2>Восстановление пароля</h2><p>Здравствуйте, ${user.name}!</p><p>Нажмите кнопку для сброса пароля:</p><a href="${resetLink}" style="display:inline-block;padding:14px 28px;background:#1DB954;color:white;text-decoration:none;border-radius:8px;font-weight:bold;">Сбросить пароль</a><p style="color:#666;font-size:12px;margin-top:20px;">Ссылка действительна 1 час.</p></div>`
     });
 
-    console.log(`✅ Письмо для сброса пароля отправлено: ${email}`);
-    res.json({ success: true, message: 'Ссылка для сброса отправлена на email' });
-
+    console.log(`✅ Письмо сброса: ${email}`);
+    res.json({ success: true, message: 'Ссылка отправлена на email' });
   } catch (e) {
     console.error('Forgot password error:', e);
     res.status(500).json({ error: 'Ошибка отправки' });
@@ -319,52 +287,36 @@ app.post('/api/auth/forgot-password', async (req, res) => {
 
 // Сброс пароля
 app.post('/api/auth/reset-password', async (req, res) => {
+  if (!pool) return res.json({ success: true, message: 'Пароль изменён (demo)' });
+
   try {
     const { token, email, newPassword } = req.body;
 
-    if (!token || !email || !newPassword) {
-      return res.status(400).json({ error: 'Все поля обязательны' });
-    }
+    if (!token || !email || !newPassword) return res.status(400).json({ error: 'Все поля обязательны' });
+    if (newPassword.length < 6) return res.status(400).json({ error: 'Минимум 6 символов' });
 
-    if (newPassword.length < 6) {
-      return res.status(400).json({ error: 'Минимум 6 символов' });
-    }
-
-    // Ищем пользователя
     const userResult = await pool.query('SELECT id FROM users WHERE email = $1', [email.toLowerCase()]);
-    if (userResult.rows.length === 0) {
-      return res.status(400).json({ error: 'Неверный токен' });
-    }
+    if (userResult.rows.length === 0) return res.status(400).json({ error: 'Неверный токен' });
 
     const userId = userResult.rows[0].id;
 
-    // Ищем валидный токен
     const tokenResult = await pool.query(
       'SELECT id, token_hash FROM password_resets WHERE user_id = $1 AND used = FALSE AND expires_at > NOW() ORDER BY created_at DESC LIMIT 1',
       [userId]
     );
 
-    if (tokenResult.rows.length === 0) {
-      return res.status(400).json({ error: 'Токен истёк или недействителен' });
-    }
+    if (tokenResult.rows.length === 0) return res.status(400).json({ error: 'Токен истёк или недействителен' });
 
     const reset = tokenResult.rows[0];
     const valid = await bcrypt.compare(token, reset.token_hash);
+    if (!valid) return res.status(400).json({ error: 'Неверный токен' });
 
-    if (!valid) {
-      return res.status(400).json({ error: 'Неверный токен' });
-    }
-
-    // Обновляем пароль
     const passwordHash = await bcrypt.hash(newPassword, 12);
     await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [passwordHash, userId]);
     await pool.query('UPDATE password_resets SET used = TRUE WHERE id = $1', [reset.id]);
-
-    // Удаляем все старые сессии
     await pool.query('DELETE FROM sessions WHERE user_id = $1', [userId]);
 
     res.json({ success: true, message: 'Пароль успешно изменён' });
-
   } catch (e) {
     console.error('Reset password error:', e);
     res.status(500).json({ error: 'Ошибка сброса пароля' });
@@ -373,6 +325,8 @@ app.post('/api/auth/reset-password', async (req, res) => {
 
 // Выход
 app.post('/api/auth/logout', authMiddleware, async (req, res) => {
+  if (!pool) return res.json({ success: true });
+
   try {
     const token = req.headers.authorization.replace('Bearer ', '');
     const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
@@ -383,6 +337,11 @@ app.post('/api/auth/logout', authMiddleware, async (req, res) => {
   }
 });
 
+// Профиль
+app.get('/api/auth/me', authMiddleware, (req, res) => {
+  res.json({ user: req.user });
+});
+
 // ═══════════════════════════════════════════════════════════════
 // GENERATION
 // ═══════════════════════════════════════════════════════════════
@@ -391,7 +350,6 @@ app.post('/api/generate', authMiddleware, async (req, res) => {
     const { topic, maxSlides = 5 } = req.body;
     if (!topic) return res.status(400).json({ error: 'Тема не указана' });
 
-    // Проверка лимитов
     const user = req.user;
     if (!user.is_premium && user.free_generations_left <= 0) {
       return res.status(402).json({ error: 'Бесплатные генерации закончились. Оформите Premium.' });
@@ -399,27 +357,16 @@ app.post('/api/generate', authMiddleware, async (req, res) => {
 
     console.log(`🎯 Генерация: "${topic}" для ${user.email}`);
 
-    const prompt = `Ты — эксперт и профессиональный спикер. Создай детальную структуру презентации на тему: "${topic}".
+    const prompt = `Ты — эксперт. Создай структуру презентации: "${topic}". Слайдов: ${maxSlides}.
 
-Количество слайдов: ${maxSlides}
+ПРАВИЛА:
+- Конкретные факты, цифры, примеры
+- Заголовки содержательные, НЕ вопросы
+- Структура: Введение → Факты → Примеры → Выводы
+- Минимум 3 содержательных пункта на слайд
 
-КРИТИЧЕСКИ ВАЖНЫЕ ПРАВИЛА:
-1. Каждый слайд должен содержать КОНКРЕТНЫЕ факты, цифры, примеры, определения.
-2. ИСПОЛЬЗУЙ точные данные: даты, проценты, имена учёных, названия открытий.
-3. Заголовки — содержательные и конкретные, НЕ вопросы.
-4. СТРУКТУРА: Введение → Факты/Детали → Примеры/Применение → Выводы
-5. Минимум 3 пункта в каждом слайде. Каждый пункт — 1-2 предложения с фактами.
-
-Верни ТОЛЬКО валидный JSON, без markdown. Формат:
-{
-  "title": "Название",
-  "slides": [
-    {
-      "title": "Конкретный заголовок",
-      "content": ["Детальный факт с цифрами", "Детальный факт с цифрами", "Детальный факт с цифрами"]
-    }
-  ]
-}`;
+Верни ТОЛЬКО JSON:
+{"title":"Название","slides":[{"title":"Заголовок","content":["Факт 1","Факт 2","Факт 3"]}]}`;
 
     const response = await axios.post(YANDEX_URL, {
       modelUri: `gpt://${YANDEX_FOLDER_ID}/yandexgpt/latest`,
@@ -434,34 +381,30 @@ app.post('/api/generate', authMiddleware, async (req, res) => {
     const cleanText = text.replace(/```json\n?/g, '').replace(/```/g, '').trim();
     const presentation = JSON.parse(cleanText);
 
-    // Списываем генерацию
-    if (!user.is_premium) {
+    if (pool && !user.is_premium) {
       await pool.query(
         'UPDATE users SET free_generations_left = free_generations_left - 1, total_generations = total_generations + 1 WHERE id = $1',
         [user.id]
       );
-    } else {
+    } else if (pool) {
       await pool.query('UPDATE users SET total_generations = total_generations + 1 WHERE id = $1', [user.id]);
     }
     
-    console.log(`✅ Сгенерировано ${presentation.slides?.length || 0} слайдов`);
+    console.log(`✅ ${presentation.slides?.length || 0} слайдов`);
     res.json(presentation);
-
   } catch (error) {
     console.error('❌ Ошибка генерации:', error.message);
     res.status(500).json({ error: 'Ошибка генерации' });
   }
 });
 
-// ═══════════════════════════════════════════════════════════════
-// TEXT IMPROVE
-// ═══════════════════════════════════════════════════════════════
+// Улучшение текста
 app.post('/api/improve', authMiddleware, async (req, res) => {
   try {
     const { text } = req.body;
     if (!text) return res.status(400).json({ error: 'Текст не указан' });
 
-    const prompt = `Улучши текст для презентации. Сделай профессиональнее и убедительнее. Верни ТОЛЬКО улучшенный текст, без пояснений.\n\nИсходный текст: "${text}"\n\nУлучшенный текст:`;
+    const prompt = `Улучши текст для презентации. Верни ТОЛЬКО улучшенный текст.\n\nИсходный: "${text}"\n\nУлучшенный:`;
 
     const response = await axios.post(YANDEX_URL, {
       modelUri: `gpt://${YANDEX_FOLDER_ID}/yandexgpt/latest`,
@@ -478,13 +421,16 @@ app.post('/api/improve', authMiddleware, async (req, res) => {
   }
 });
 
+// Картинки
+app.post('/api/images/search', async (req, res) => {
+  res.json({ images: [], keywords: req.body.keywords, placeholder: true });
+});
+
 // ═══════════════════════════════════════════════════════════════
 // START
 // ═══════════════════════════════════════════════════════════════
 app.listen(PORT, () => {
-  console.log(`🚀 Сервер запущен на порту ${PORT}`);
+  console.log(`🚀 Сервер на порту ${PORT}`);
+  console.log(`📊 БД: ${pool ? 'подключена' : 'отключена (demo режим)'}`);
   console.log(`📊 Health: http://localhost:${PORT}/api/health`);
-  console.log(`📝 Auth:   POST /api/auth/register | /api/auth/login | /api/auth/forgot-password`);
-  console.log(`🎯 Generate: POST /api/generate (🔒 auth)`);
-  console.log(`✨ Improve:  POST /api/improve (🔒 auth)`);
 });
