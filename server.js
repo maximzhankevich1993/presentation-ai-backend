@@ -22,17 +22,100 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '1mb' }));
 
-// Database
+// ═══════════════════════════════════════════════════════════════
+// DATABASE
+// ═══════════════════════════════════════════════════════════════
 const pool = process.env.DATABASE_URL 
   ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } })
   : null;
 
-// YandexGPT
+// ═══════════════════════════════════════════════════════════════
+// AUTO-CREATE TABLES
+// ═══════════════════════════════════════════════════════════════
+async function initDatabase() {
+  if (!pool) return;
+  
+  try {
+    await pool.query(`
+      CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+      CREATE TABLE IF NOT EXISTS users (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        email VARCHAR(255) UNIQUE NOT NULL,
+        password_hash VARCHAR(255) NOT NULL,
+        name VARCHAR(255),
+        country VARCHAR(10),
+        is_premium BOOLEAN DEFAULT FALSE,
+        premium_expiry TIMESTAMPTZ,
+        free_generations_left INTEGER DEFAULT 10,
+        total_generations INTEGER DEFAULT 0,
+        surprise_uses_left INTEGER DEFAULT 3,
+        email_verified BOOLEAN DEFAULT FALSE,
+        verification_token VARCHAR(255),
+        last_login TIMESTAMPTZ,
+        failed_login_attempts INTEGER DEFAULT 0,
+        locked_until TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS sessions (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        token_hash VARCHAR(255) UNIQUE NOT NULL,
+        ip_address VARCHAR(45),
+        user_agent TEXT,
+        expires_at TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token_hash);
+      CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+
+      CREATE TABLE IF NOT EXISTS password_resets (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        token_hash VARCHAR(255) NOT NULL,
+        expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '1 hour',
+        used BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS presentations (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        title VARCHAR(500) NOT NULL,
+        slides_data JSONB NOT NULL DEFAULT '[]',
+        slide_count INTEGER DEFAULT 0,
+        font_pair VARCHAR(100),
+        theme_id VARCHAR(100),
+        transition_type VARCHAR(50) DEFAULT 'fade',
+        is_public BOOLEAN DEFAULT FALSE,
+        views INTEGER DEFAULT 0,
+        likes INTEGER DEFAULT 0,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_presentations_user ON presentations(user_id);
+    `);
+    
+    console.log('✅ Таблицы созданы/проверены');
+  } catch (e) {
+    console.error('❌ Ошибка создания таблиц:', e.message);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// YANDEX GPT
+// ═══════════════════════════════════════════════════════════════
 const YANDEX_API_KEY = process.env.YANDEX_API_KEY;
 const YANDEX_FOLDER_ID = process.env.YANDEX_FOLDER_ID;
 const YANDEX_URL = 'https://llm.api.cloud.yandex.net/foundationModels/v1/completion';
 
-// Email
+// ═══════════════════════════════════════════════════════════════
+// EMAIL
+// ═══════════════════════════════════════════════════════════════
 const transporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST || 'smtp.sendgrid.net',
   port: parseInt(process.env.SMTP_PORT || '587'),
@@ -49,7 +132,9 @@ if (!YANDEX_API_KEY || !YANDEX_FOLDER_ID) {
   process.exit(1);
 }
 
-// Необязательная авторизация: если есть токен — используем, нет — гость
+// ═══════════════════════════════════════════════════════════════
+// MIDDLEWARE
+// ═══════════════════════════════════════════════════════════════
 async function optionalAuth(req, res, next) {
   const token = req.headers.authorization?.replace('Bearer ', '');
   
@@ -79,7 +164,9 @@ async function optionalAuth(req, res, next) {
   }
 }
 
-// Health
+// ═══════════════════════════════════════════════════════════════
+// HEALTH CHECK
+// ═══════════════════════════════════════════════════════════════
 app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'ok', 
@@ -90,9 +177,9 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// ═══════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════
 // AUTH
-// ═══════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════
 
 app.post('/api/auth/register', async (req, res) => {
   if (!pool) {
@@ -207,15 +294,6 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     const resetToken = crypto.randomBytes(32).toString('hex');
     const resetTokenHash = await bcrypt.hash(resetToken, 10);
 
-    await pool.query(`CREATE TABLE IF NOT EXISTS password_resets (
-      id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-      user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-      token_hash VARCHAR(255) NOT NULL,
-      expires_at TIMESTAMPTZ DEFAULT NOW() + INTERVAL '1 hour',
-      used BOOLEAN DEFAULT FALSE,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    )`);
-
     await pool.query('INSERT INTO password_resets (user_id, token_hash) VALUES ($1, $2)', [user.id, resetTokenHash]);
 
     const resetLink = `https://presentation-ai.com/reset-password?token=${resetToken}&email=${email}`;
@@ -249,10 +327,9 @@ app.post('/api/auth/logout', async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════
-// GENERATE (optional auth — работает без токена)
-// ═══════════════════════════════════════════
-
+// ═══════════════════════════════════════════════════════════════
+// GENERATE
+// ═══════════════════════════════════════════════════════════════
 app.post('/api/generate', optionalAuth, async (req, res) => {
   try {
     const { topic, maxSlides = 5 } = req.body;
@@ -261,7 +338,6 @@ app.post('/api/generate', optionalAuth, async (req, res) => {
     const user = req.user;
     console.log(`🎯 Генерация: "${topic}" (${user.email})`);
 
-    // Проверка лимита только для real users
     if (pool && user.id !== 'guest' && !user.is_premium && user.free_generations_left <= 0) {
       return res.status(402).json({ error: 'Бесплатные генерации закончились' });
     }
@@ -302,7 +378,6 @@ app.post('/api/generate', optionalAuth, async (req, res) => {
   } catch (e) {
     console.error('❌ Generation error:', e.message);
     
-    // Fallback
     const slides = [];
     for (let i = 0; i < (maxSlides || 5); i++) {
       slides.push({
@@ -337,14 +412,17 @@ app.post('/api/improve', optionalAuth, async (req, res) => {
   }
 });
 
-// Images
 app.post('/api/images/search', async (req, res) => {
   res.json({ images: [], keywords: req.body.keywords, placeholder: true });
 });
 
-// Start
-app.listen(PORT, () => {
-  console.log(`🚀 Сервер на порту ${PORT}`);
-  console.log(`📊 БД: ${pool ? 'подключена' : 'DEMO режим'}`);
-  console.log(`🔓 Генерация работает без авторизации (гостевой доступ)`);
+// ═══════════════════════════════════════════════════════════════
+// START
+// ═══════════════════════════════════════════════════════════════
+initDatabase().then(() => {
+  app.listen(PORT, () => {
+    console.log(`🚀 Сервер на порту ${PORT}`);
+    console.log(`📊 БД: ${pool ? 'подключена' : 'DEMO режим'}`);
+    console.log(`🔓 Генерация работает без авторизации (гостевой доступ)`);
+  });
 });
