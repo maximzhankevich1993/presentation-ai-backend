@@ -98,9 +98,120 @@ async function initDatabase() {
       );
 
       CREATE INDEX IF NOT EXISTS idx_presentations_user ON presentations(user_id);
+
+      -- ============================================
+      -- ТАБЛИЦА ШАБЛОНОВ
+      -- ============================================
+      CREATE TABLE IF NOT EXISTS templates (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        title VARCHAR(255) NOT NULL,
+        description TEXT,
+        category VARCHAR(100) NOT NULL,
+        color1 VARCHAR(7),
+        color2 VARCHAR(7),
+        slide_count INTEGER DEFAULT 1,
+        is_premium BOOLEAN DEFAULT false,
+        is_popular BOOLEAN DEFAULT false,
+        icon VARCHAR(50),
+        slides_data JSONB NOT NULL,
+        preview_url TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_templates_category ON templates(category);
+      CREATE INDEX IF NOT EXISTS idx_templates_is_premium ON templates(is_premium);
+      CREATE INDEX IF NOT EXISTS idx_templates_is_popular ON templates(is_popular);
+
+      -- ============================================
+      -- ВСТАВКА 10 БЕСПЛАТНЫХ ШАБЛОНОВ
+      -- ============================================
+      INSERT INTO templates (title, description, category, color1, color2, slide_count, is_premium, is_popular, icon, slides_data) VALUES
+      ('Пустой', 'Начните с чистого листа', 'Все', '#1A1A1A', '#2A2A2A', 1, false, false, 'crop_original_rounded', '[{"title":"Новая презентация","content":["Начните добавлять контент"]}]')
+      ON CONFLICT DO NOTHING;
+
+      INSERT INTO templates (title, description, category, color1, color2, slide_count, is_premium, is_popular, icon, slides_data) VALUES
+      ('Влияние соседей на продуктивность', 'Анализ влияния окружения на эффективность работы', 'Бизнес', '#667eea', '#764ba2', 8, false, true, 'people_rounded', '[{"title":"Влияние соседей на продуктивность","content":["Анализ влияния окружения","Ключевые факторы"]},{"title":"Статистика","content":["Данные исследования","Графики зависимости"]},{"title":"Выводы","content":["Рекомендации по улучшению","Практические советы"]}]')
+      ON CONFLICT DO NOTHING;
+
+      INSERT INTO templates (title, description, category, color1, color2, slide_count, is_premium, is_popular, icon, slides_data) VALUES
+      ('Видео-репортаж про продукт', 'Презентация продукта в формате видео-отчета', 'Маркетинг', '#f093fb', '#f5576c', 6, false, true, 'videocam_rounded', '[{"title":"Видео-репортаж","content":["О продукте","Ключевые особенности"]},{"title":"Демонстрация","content":["Скриншоты","Видео материалы"]}]')
+      ON CONFLICT DO NOTHING;
+
+      INSERT INTO templates (title, description, category, color1, color2, slide_count, is_premium, is_popular, icon, slides_data) VALUES
+      ('Бордер-колли: ваш активный друг', 'Происхождение, характер, дрессировка и уход', 'Личные', '#4facfe', '#00f2fe', 10, false, true, 'pets_rounded', '[{"title":"Бордер-колли","content":["Происхождение породы","Характер"]},{"title":"Дрессировка","content":["Основные команды","Советы по обучению"]},{"title":"Уход","content":["Питание","Здоровье","Физические нагрузки"]}]')
+      ON CONFLICT DO NOTHING;
+
+      INSERT INTO templates (title, description, category, color1, color2, slide_count, is_premium, is_popular, icon, slides_data) VALUES
+      ('Александр Волков', 'Архитектор цифровых стратегий и лидер продуктовых команд', 'Личные', '#434343', '#000000', 5, false, false, 'person_rounded', '[{"title":"Александр Волков","content":["Архитектор цифровых стратегий","Лидер продуктовых команд"]},{"title":"Опыт работы","content":["Проекты","Достижения"]},{"title":"Контакты","content":["Email","Telegram","LinkedIn"]}]')
+      ON CONFLICT DO NOTHING;
+
+      INSERT INTO templates (title, description, category, color1, color2, slide_count, is_premium, is_popular, icon, slides_data) VALUES
+      ('Бизнес-план', 'Структура и финансовые показатели', 'Бизнес', '#1DB954', '#1ED760', 8, false, false, 'business_center_rounded', '[{"title":"Бизнес-план","content":["Краткое описание проекта","Цели и задачи"]},{"title":"Анализ рынка","content":["Конкуренты","Целевая аудитория","Тренды"]},{"title":"Финансовый план","content":["Прогноз доходов","Инвестиции","Окупаемость"]}]')
+      ON CONFLICT DO NOTHING;
+
+      INSERT INTO templates (title, description, category, color1, color2, slide_count, is_premium, is_popular, icon, slides_data) VALUES
+      ('Маркетинговая стратегия', 'План продвижения на 2024 год', 'Маркетинг', '#fa709a', '#fee140', 12, false, false, 'trending_up_rounded', '[{"title":"Маркетинговая стратегия","content":["Цели","KPI","Бюджет"]},{"title":"Каналы продвижения","content":["SEO","Контекстная реклама","Соцсети"]},{"title":"Календарный план","content":["Мероприятия","Дедлайны"]}]')
+      ON CONFLICT DO NOTHING;
+
+      INSERT INTO templates (title, description, category, color1, color2, slide_count, is_premium, is_popular, icon, slides_data) VALUES
+      ('План урока', 'Готовая структура занятия', 'Образование', '#8E2DE2', '#4A00E0', 8, false, true, 'school_rounded', '[{"title":"План урока","content":["Тема урока","Цели и задачи"]},{"title":"Ход урока","content":["Организационный момент","Объяснение","Закрепление","Рефлексия"]},{"title":"Домашнее задание","content":["Задание","Сроки"]}]')
+      ON CONFLICT DO NOTHING;
+
+      INSERT INTO templates (title, description, category, color1, color2, slide_count, is_premium, is_popular, icon, slides_data) VALUES
+      ('Годовой аналитический отчет', 'supr.ru — полный анализ деятельности за год', 'Отчёты', '#11998e', '#38ef7d', 15, false, true, 'analytics_rounded', '[{"title":"Годовой аналитический отчет","content":["Ключевые показатели","Динамика роста","Достижения"]},{"title":"Ключевые метрики","content":["Выручка","Прибыль","Клиенты","ROI"]},{"title":"Планы на следующий год","content":["Цели","Задачи","Бюджет"]}]')
+      ON CONFLICT DO NOTHING;
+
+      INSERT INTO templates (title, description, category, color1, color2, slide_count, is_premium, is_popular, icon, slides_data) VALUES
+      ('Статус проекта', 'Отчёт о ходе выполнения', 'Отчёты', '#FF416C', '#FF4B2B', 6, false, false, 'task_alt_rounded', '[{"title":"Статус проекта","content":["Общая информация","Даты"]},{"title":"Выполненные задачи","content":["Список завершённых задач"]},{"title":"Риски и проблемы","content":["Текущие риски","План решения"]}]')
+      ON CONFLICT DO NOTHING;
+
+      -- ============================================
+      -- ВСТАВКА 10 ПРЕМИУМ ШАБЛОНОВ
+      -- ============================================
+      INSERT INTO templates (title, description, category, color1, color2, slide_count, is_premium, is_popular, icon, slides_data) VALUES
+      ('Четыре колонки', 'Сравнение 4-х показателей', 'Бизнес', '#1DB954', '#1ED760', 3, true, true, 'view_quilt_rounded', '[{"title":"Сравнительный анализ","content":["Показатель 1","Показатель 2","Показатель 3","Показатель 4"]}]')
+      ON CONFLICT DO NOTHING;
+
+      INSERT INTO templates (title, description, category, color1, color2, slide_count, is_premium, is_popular, icon, slides_data) VALUES
+      ('SWOT-анализ', 'Сильные и слабые стороны', 'Бизнес', '#667eea', '#764ba2', 4, true, true, 'analytics_rounded', '[{"title":"SWOT-анализ","content":["Сильные стороны","Слабые стороны","Возможности","Угрозы"]}]')
+      ON CONFLICT DO NOTHING;
+
+      INSERT INTO templates (title, description, category, color1, color2, slide_count, is_premium, is_popular, icon, slides_data) VALUES
+      ('Таймлайн', 'Визуализация событий во времени', 'Бизнес', '#f093fb', '#f5576c', 5, true, false, 'timeline_rounded', '[{"title":"История проекта","content":["Этап 1: 2020","Этап 2: 2021","Этап 3: 2022","Этап 4: 2023"]}]')
+      ON CONFLICT DO NOTHING;
+
+      INSERT INTO templates (title, description, category, color1, color2, slide_count, is_premium, is_popular, icon, slides_data) VALUES
+      ('Команда', 'Представление сотрудников', 'Бизнес', '#4facfe', '#00f2fe', 6, true, true, 'group_rounded', '[{"title":"Наша команда","content":["Имя: Должность","Имя: Должность","Имя: Должность"]}]')
+      ON CONFLICT DO NOTHING;
+
+      INSERT INTO templates (title, description, category, color1, color2, slide_count, is_premium, is_popular, icon, slides_data) VALUES
+      ('Портфолио', 'Ваши лучшие работы', 'Личные', '#00b4db', '#0083B0', 10, true, false, 'photo_library_rounded', '[{"title":"Проект 1","content":["Описание проекта","Результаты"]},{"title":"Проект 2","content":["Описание проекта","Результаты"]}]')
+      ON CONFLICT DO NOTHING;
+
+      INSERT INTO templates (title, description, category, color1, color2, slide_count, is_premium, is_popular, icon, slides_data) VALUES
+      ('Питч стартапа', 'Презентация для инвесторов', 'Бизнес', '#FFE000', '#799F0C', 8, true, true, 'rocket_launch_rounded', '[{"title":"Наш стартап","content":["Проблема","Решение","Рынок"]},{"title":"Финансы","content":["Прогноз доходов","Инвестиции"]}]')
+      ON CONFLICT DO NOTHING;
+
+      INSERT INTO templates (title, description, category, color1, color2, slide_count, is_premium, is_popular, icon, slides_data) VALUES
+      ('KPI Dashboard', 'Отчёт с метриками', 'Отчёты', '#FF416C', '#FF4B2B', 7, true, true, 'dashboard_rounded', '[{"title":"Ключевые показатели","content":["Выручка: 1.2M","Прибыль: 300K","Клиенты: 5000"]},{"title":"Динамика","content":["График роста","Сезонность"]}]')
+      ON CONFLICT DO NOTHING;
+
+      INSERT INTO templates (title, description, category, color1, color2, slide_count, is_premium, is_popular, icon, slides_data) VALUES
+      ('Дорожная карта', 'План развития продукта', 'Бизнес', '#11998e', '#38ef7d', 6, true, false, 'map_rounded', '[{"title":"Дорожная карта","content":["Q1 2024","Q2 2024","Q3 2024","Q4 2024"]}]')
+      ON CONFLICT DO NOTHING;
+
+      INSERT INTO templates (title, description, category, color1, color2, slide_count, is_premium, is_popular, icon, slides_data) VALUES
+      ('Контакты', 'Карта и контактная информация', 'Бизнес', '#8E2DE2', '#4A00E0', 4, true, false, 'contact_phone_rounded', '[{"title":"Свяжитесь с нами","content":["Телефон","Email","Адрес"]}]')
+      ON CONFLICT DO NOTHING;
+
+      INSERT INTO templates (title, description, category, color1, color2, slide_count, is_premium, is_popular, icon, slides_data) VALUES
+      ('Сравнение продуктов', 'Сравнение характеристик', 'Маркетинг', '#434343', '#000000', 5, true, false, 'compare_arrows_rounded', '[{"title":"Сравнение","content":["Функция 1","Продукт А","Продукт Б","Продукт В"]}]')
+      ON CONFLICT DO NOTHING;
     `);
     
     console.log('✅ Таблицы созданы/проверены');
+    console.log('✅ 20 шаблонов добавлено (10 бесплатных + 10 премиум)');
   } catch (e) {
     console.error('❌ Ошибка создания таблиц:', e.message);
   }
@@ -175,6 +286,197 @@ app.get('/api/health', (req, res) => {
     api: 'YandexGPT',
     db: !!pool
   });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// TEMPLATES API
+// ═══════════════════════════════════════════════════════════════
+
+// GET /api/templates - получить все шаблоны (с фильтрацией по premium)
+app.get('/api/templates', optionalAuth, async (req, res) => {
+  if (!pool) {
+    // Fallback для демо-режима
+    return res.json({ 
+      success: true, 
+      templates: [],
+      message: 'БД не подключена, используйте локальные шаблоны'
+    });
+  }
+
+  try {
+    const { include_premium } = req.query;
+    const user = req.user;
+    
+    let query = 'SELECT * FROM templates WHERE 1=1';
+    const params = [];
+    
+    // Если пользователь не premium и не запрошены премиум шаблоны
+    const showPremium = include_premium === 'true' && user && user.is_premium;
+    if (!showPremium) {
+      query += ' AND is_premium = false';
+    }
+    
+    query += ' ORDER BY is_popular DESC, created_at DESC';
+    
+    const result = await pool.query(query, params);
+    
+    res.json({
+      success: true,
+      templates: result.rows,
+      include_premium: showPremium
+    });
+  } catch (error) {
+    console.error('Error fetching templates:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// GET /api/templates/free - получить бесплатные шаблоны
+app.get('/api/templates/free', async (req, res) => {
+  if (!pool) {
+    return res.json({ success: true, templates: [] });
+  }
+
+  try {
+    const result = await pool.query(
+      'SELECT * FROM templates WHERE is_premium = false ORDER BY is_popular DESC, created_at DESC'
+    );
+    
+    res.json({
+      success: true,
+      templates: result.rows
+    });
+  } catch (error) {
+    console.error('Error fetching free templates:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// GET /api/templates/premium - получить премиум шаблоны (только для premium пользователей)
+app.get('/api/templates/premium', optionalAuth, async (req, res) => {
+  if (!pool) {
+    return res.json({ success: true, templates: [] });
+  }
+
+  try {
+    const user = req.user;
+    
+    // Проверка на premium доступ
+    if (!user || (user.id !== 'guest' && !user.is_premium)) {
+      return res.status(403).json({ error: 'Premium доступ только для подписчиков' });
+    }
+    
+    const result = await pool.query(
+      'SELECT * FROM templates WHERE is_premium = true ORDER BY is_popular DESC, created_at DESC'
+    );
+    
+    res.json({
+      success: true,
+      templates: result.rows
+    });
+  } catch (error) {
+    console.error('Error fetching premium templates:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// GET /api/templates/:id - получить шаблон по ID
+app.get('/api/templates/:id', async (req, res) => {
+  if (!pool) {
+    return res.status(404).json({ error: 'Template not found' });
+  }
+
+  try {
+    const { id } = req.params;
+    const result = await pool.query('SELECT * FROM templates WHERE id = $1', [id]);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Template not found' });
+    }
+    
+    res.json({
+      success: true,
+      template: result.rows[0]
+    });
+  } catch (error) {
+    console.error('Error fetching template:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST /api/templates - создать новый шаблон (только для premium пользователей)
+app.post('/api/templates', optionalAuth, async (req, res) => {
+  if (!pool) {
+    return res.status(503).json({ error: 'Database not available' });
+  }
+
+  try {
+    const user = req.user;
+    
+    // Только авторизованные пользователи могут создавать шаблоны
+    if (!user || user.id === 'guest') {
+      return res.status(401).json({ error: 'Требуется авторизация' });
+    }
+    
+    const { title, description, category, color1, color2, slide_count, icon, slides_data } = req.body;
+    
+    if (!title || !category || !slides_data) {
+      return res.status(400).json({ error: 'Заголовок, категория и данные слайдов обязательны' });
+    }
+    
+    const result = await pool.query(
+      `INSERT INTO templates (title, description, category, color1, color2, slide_count, is_premium, icon, slides_data)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       RETURNING *`,
+      [title, description, category, color1, color2, slide_count || 1, false, icon, slides_data]
+    );
+    
+    res.json({
+      success: true,
+      template: result.rows[0]
+    });
+  } catch (error) {
+    console.error('Error creating template:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// DELETE /api/templates/:id - удалить шаблон (только создатель или админ)
+app.delete('/api/templates/:id', optionalAuth, async (req, res) => {
+  if (!pool) {
+    return res.status(503).json({ error: 'Database not available' });
+  }
+
+  try {
+    const user = req.user;
+    
+    if (!user || user.id === 'guest') {
+      return res.status(401).json({ error: 'Требуется авторизация' });
+    }
+    
+    const { id } = req.params;
+    
+    // Проверяем, существует ли шаблон и не является ли он системным
+    const checkResult = await pool.query('SELECT is_premium FROM templates WHERE id = $1', [id]);
+    if (checkResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Template not found' });
+    }
+    
+    // Системные шаблоны нельзя удалять
+    if (!checkResult.rows[0].is_premium) {
+      return res.status(403).json({ error: 'Системные шаблоны нельзя удалять' });
+    }
+    
+    await pool.query('DELETE FROM templates WHERE id = $1', [id]);
+    
+    res.json({
+      success: true,
+      message: 'Template deleted successfully'
+    });
+  } catch (error) {
+    console.error('Error deleting template:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════
@@ -423,6 +725,7 @@ initDatabase().then(() => {
   app.listen(PORT, () => {
     console.log(`🚀 Сервер на порту ${PORT}`);
     console.log(`📊 БД: ${pool ? 'подключена' : 'DEMO режим'}`);
+    console.log(`📋 Шаблоны: ${pool ? '20 шаблонов загружено' : 'локальные'}`);
     console.log(`🔓 Генерация работает без авторизации (гостевой доступ)`);
   });
 });
