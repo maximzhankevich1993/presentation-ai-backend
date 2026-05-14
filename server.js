@@ -42,7 +42,7 @@ async function initDatabase() {
       CREATE TABLE IF NOT EXISTS users (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
         email VARCHAR(255) UNIQUE NOT NULL,
-        password_hash VARCHAR(255) NOT NULL,
+        password_hash VARCHAR(255),
         name VARCHAR(255),
         country VARCHAR(10),
         is_premium BOOLEAN DEFAULT FALSE,
@@ -56,8 +56,16 @@ async function initDatabase() {
         failed_login_attempts INTEGER DEFAULT 0,
         locked_until TIMESTAMPTZ,
         created_at TIMESTAMPTZ DEFAULT NOW(),
-        updated_at TIMESTAMPTZ DEFAULT NOW()
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        
+        -- НОВЫЕ ПОЛЯ ДЛЯ СОЦИАЛЬНОЙ АВТОРИЗАЦИИ
+        social_id VARCHAR(255) UNIQUE,
+        social_provider VARCHAR(50),
+        avatar_url TEXT
       );
+
+      CREATE INDEX IF NOT EXISTS idx_users_social_id ON users(social_id);
+      CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
 
       CREATE TABLE IF NOT EXISTS sessions (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -99,9 +107,7 @@ async function initDatabase() {
 
       CREATE INDEX IF NOT EXISTS idx_presentations_user ON presentations(user_id);
 
-      -- ============================================
       -- ТАБЛИЦА ШАБЛОНОВ
-      -- ============================================
       CREATE TABLE IF NOT EXISTS templates (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
         title VARCHAR(255) NOT NULL,
@@ -123,9 +129,7 @@ async function initDatabase() {
       CREATE INDEX IF NOT EXISTS idx_templates_is_premium ON templates(is_premium);
       CREATE INDEX IF NOT EXISTS idx_templates_is_popular ON templates(is_popular);
 
-      -- ============================================
       -- ВСТАВКА 10 БЕСПЛАТНЫХ ШАБЛОНОВ
-      -- ============================================
       INSERT INTO templates (title, description, category, color1, color2, slide_count, is_premium, is_popular, icon, slides_data) VALUES
       ('Пустой', 'Начните с чистого листа', 'Все', '#1A1A1A', '#2A2A2A', 1, false, false, 'crop_original_rounded', '[{"title":"Новая презентация","content":["Начните добавлять контент"]}]')
       ON CONFLICT DO NOTHING;
@@ -166,9 +170,7 @@ async function initDatabase() {
       ('Статус проекта', 'Отчёт о ходе выполнения', 'Отчёты', '#FF416C', '#FF4B2B', 6, false, false, 'task_alt_rounded', '[{"title":"Статус проекта","content":["Общая информация","Даты"]},{"title":"Выполненные задачи","content":["Список завершённых задач"]},{"title":"Риски и проблемы","content":["Текущие риски","План решения"]}]')
       ON CONFLICT DO NOTHING;
 
-      -- ============================================
       -- ВСТАВКА 10 ПРЕМИУМ ШАБЛОНОВ
-      -- ============================================
       INSERT INTO templates (title, description, category, color1, color2, slide_count, is_premium, is_popular, icon, slides_data) VALUES
       ('Четыре колонки', 'Сравнение 4-х показателей', 'Бизнес', '#1DB954', '#1ED760', 3, true, true, 'view_quilt_rounded', '[{"title":"Сравнительный анализ","content":["Показатель 1","Показатель 2","Показатель 3","Показатель 4"]}]')
       ON CONFLICT DO NOTHING;
@@ -289,13 +291,103 @@ app.get('/api/health', (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
+// СОЦИАЛЬНАЯ АВТОРИЗАЦИЯ (НОВЫЙ ЭНДПОИНТ)
+// ═══════════════════════════════════════════════════════════════
+app.post('/api/auth/social', async (req, res) => {
+  if (!pool) {
+    return res.json({ 
+      token: 'demo-token', 
+      user: { 
+        id: 'demo', 
+        email: req.body.email || `${req.body.id}@social.com`,
+        name: req.body.name || 'Пользователь',
+        isPremium: false,
+        freeGenerationsLeft: 10 
+      } 
+    });
+  }
+
+  try {
+    const { id, email, name, avatarUrl, provider } = req.body;
+    
+    if (!id || !provider) {
+      return res.status(400).json({ error: 'Недостаточно данных для авторизации' });
+    }
+
+    // Формируем уникальный social_id
+    const socialId = `${provider}_${id}`;
+    
+    // Генерируем email для соцсетей, которые его не возвращают (VK)
+    const userEmail = email || `${id}@${provider}.social.com`;
+    
+    // Ищем пользователя по social_id или email
+    let result = await pool.query(
+      'SELECT * FROM users WHERE social_id = $1 OR email = $2',
+      [socialId, userEmail.toLowerCase()]
+    );
+
+    let user;
+
+    if (result.rows.length === 0) {
+      // Создаём нового пользователя
+      const insertResult = await pool.query(
+        `INSERT INTO users (email, name, social_id, social_provider, avatar_url, free_generations_left)
+         VALUES ($1, $2, $3, $4, $5, 10)
+         RETURNING id, email, name, is_premium, free_generations_left, avatar_url`,
+        [userEmail.toLowerCase(), name || 'Пользователь', socialId, provider, avatarUrl || null]
+      );
+      user = insertResult.rows[0];
+      
+      console.log(`✅ Новый пользователь через ${provider}: ${user.name} (${user.email})`);
+    } else {
+      user = result.rows[0];
+      
+      // Обновляем avatar_url если его нет
+      if (!user.avatar_url && avatarUrl) {
+        await pool.query('UPDATE users SET avatar_url = $1 WHERE id = $2', [avatarUrl, user.id]);
+        user.avatar_url = avatarUrl;
+      }
+      
+      console.log(`✅ Вход через ${provider}: ${user.name}`);
+    }
+
+    // Создаём сессию
+    const sessionToken = crypto.randomBytes(48).toString('hex');
+    const tokenHash = crypto.createHash('sha256').update(sessionToken).digest('hex');
+    
+    await pool.query(
+      `INSERT INTO sessions (user_id, token_hash, expires_at) 
+       VALUES ($1, $2, NOW() + INTERVAL '30 days')`,
+      [user.id, tokenHash]
+    );
+
+    // Отправляем ответ
+    res.json({
+      token: sessionToken,
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        isPremium: user.is_premium || false,
+        freeGenerationsLeft: user.free_generations_left || 10,
+        avatarUrl: user.avatar_url,
+        socialProvider: provider,
+      }
+    });
+    
+  } catch (error) {
+    console.error('❌ Social auth error:', error);
+    res.status(500).json({ error: 'Ошибка социальной авторизации' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
 // TEMPLATES API
 // ═══════════════════════════════════════════════════════════════
 
 // GET /api/templates - получить все шаблоны (с фильтрацией по premium)
 app.get('/api/templates', optionalAuth, async (req, res) => {
   if (!pool) {
-    // Fallback для демо-режима
     return res.json({ 
       success: true, 
       templates: [],
@@ -361,7 +453,6 @@ app.get('/api/templates/premium', optionalAuth, async (req, res) => {
   try {
     const user = req.user;
     
-    // Проверка на premium доступ
     if (!user || (user.id !== 'guest' && !user.is_premium)) {
       return res.status(403).json({ error: 'Premium доступ только для подписчиков' });
     }
@@ -404,7 +495,7 @@ app.get('/api/templates/:id', async (req, res) => {
   }
 });
 
-// POST /api/templates - создать новый шаблон (только для premium пользователей)
+// POST /api/templates - создать новый шаблон
 app.post('/api/templates', optionalAuth, async (req, res) => {
   if (!pool) {
     return res.status(503).json({ error: 'Database not available' });
@@ -413,7 +504,6 @@ app.post('/api/templates', optionalAuth, async (req, res) => {
   try {
     const user = req.user;
     
-    // Только авторизованные пользователи могут создавать шаблоны
     if (!user || user.id === 'guest') {
       return res.status(401).json({ error: 'Требуется авторизация' });
     }
@@ -441,7 +531,7 @@ app.post('/api/templates', optionalAuth, async (req, res) => {
   }
 });
 
-// DELETE /api/templates/:id - удалить шаблон (только создатель или админ)
+// DELETE /api/templates/:id - удалить шаблон
 app.delete('/api/templates/:id', optionalAuth, async (req, res) => {
   if (!pool) {
     return res.status(503).json({ error: 'Database not available' });
@@ -456,7 +546,6 @@ app.delete('/api/templates/:id', optionalAuth, async (req, res) => {
     
     const { id } = req.params;
     
-    // Проверяем, существует ли шаблон и не является ли он системным
     const checkResult = await pool.query('SELECT is_premium FROM templates WHERE id = $1', [id]);
     if (checkResult.rows.length === 0) {
       return res.status(404).json({ error: 'Template not found' });
@@ -726,6 +815,7 @@ initDatabase().then(() => {
     console.log(`🚀 Сервер на порту ${PORT}`);
     console.log(`📊 БД: ${pool ? 'подключена' : 'DEMO режим'}`);
     console.log(`📋 Шаблоны: ${pool ? '20 шаблонов загружено' : 'локальные'}`);
+    console.log(`🔐 Социальная авторизация: Google, Apple, VK`);
     console.log(`🔓 Генерация работает без авторизации (гостевой доступ)`);
   });
 });
