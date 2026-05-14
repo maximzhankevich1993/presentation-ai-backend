@@ -58,7 +58,6 @@ async function initDatabase() {
         created_at TIMESTAMPTZ DEFAULT NOW(),
         updated_at TIMESTAMPTZ DEFAULT NOW(),
         
-        -- НОВЫЕ ПОЛЯ ДЛЯ СОЦИАЛЬНОЙ АВТОРИЗАЦИИ
         social_id VARCHAR(255) UNIQUE,
         social_provider VARCHAR(50),
         avatar_url TEXT
@@ -107,7 +106,6 @@ async function initDatabase() {
 
       CREATE INDEX IF NOT EXISTS idx_presentations_user ON presentations(user_id);
 
-      -- ТАБЛИЦА ШАБЛОНОВ
       CREATE TABLE IF NOT EXISTS templates (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
         title VARCHAR(255) NOT NULL,
@@ -129,7 +127,73 @@ async function initDatabase() {
       CREATE INDEX IF NOT EXISTS idx_templates_is_premium ON templates(is_premium);
       CREATE INDEX IF NOT EXISTS idx_templates_is_popular ON templates(is_popular);
 
-      -- ВСТАВКА 10 БЕСПЛАТНЫХ ШАБЛОНОВ
+      -- ============================================
+      -- КОМАНДНАЯ РАБОТА (НОВЫЕ ТАБЛИЦЫ)
+      -- ============================================
+      
+      CREATE TABLE IF NOT EXISTS workspaces (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        name VARCHAR(255) NOT NULL,
+        owner_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        plan_type VARCHAR(50) DEFAULT 'team',
+        max_members INTEGER DEFAULT 5,
+        storage_used BIGINT DEFAULT 0,
+        storage_limit BIGINT DEFAULT 10737418240,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS team_members (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        workspace_id UUID REFERENCES workspaces(id) ON DELETE CASCADE,
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        role VARCHAR(50) DEFAULT 'viewer',
+        invited_by UUID REFERENCES users(id),
+        invited_at TIMESTAMPTZ DEFAULT NOW(),
+        joined_at TIMESTAMPTZ,
+        status VARCHAR(20) DEFAULT 'pending',
+        UNIQUE(workspace_id, user_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS team_templates (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        workspace_id UUID REFERENCES workspaces(id) ON DELETE CASCADE,
+        name VARCHAR(255) NOT NULL,
+        slides_data JSONB NOT NULL,
+        created_by UUID REFERENCES users(id),
+        is_favorite BOOLEAN DEFAULT FALSE,
+        used_count INTEGER DEFAULT 0,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS comments (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        presentation_id UUID REFERENCES presentations(id) ON DELETE CASCADE,
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        slide_index INTEGER NOT NULL,
+        content TEXT NOT NULL,
+        parent_id UUID REFERENCES comments(id) ON DELETE CASCADE,
+        resolved BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS presentation_versions (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        presentation_id UUID REFERENCES presentations(id) ON DELETE CASCADE,
+        version_number INTEGER NOT NULL,
+        slides_data JSONB NOT NULL,
+        created_by UUID REFERENCES users(id),
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_team_members_workspace ON team_members(workspace_id);
+      CREATE INDEX IF NOT EXISTS idx_team_members_user ON team_members(user_id);
+      CREATE INDEX IF NOT EXISTS idx_comments_presentation ON comments(presentation_id);
+      CREATE INDEX IF NOT EXISTS idx_presentation_versions_presentation ON presentation_versions(presentation_id);
+
+      -- ВСТАВКА ШАБЛОНОВ
       INSERT INTO templates (title, description, category, color1, color2, slide_count, is_premium, is_popular, icon, slides_data) VALUES
       ('Пустой', 'Начните с чистого листа', 'Все', '#1A1A1A', '#2A2A2A', 1, false, false, 'crop_original_rounded', '[{"title":"Новая презентация","content":["Начните добавлять контент"]}]')
       ON CONFLICT DO NOTHING;
@@ -170,7 +234,7 @@ async function initDatabase() {
       ('Статус проекта', 'Отчёт о ходе выполнения', 'Отчёты', '#FF416C', '#FF4B2B', 6, false, false, 'task_alt_rounded', '[{"title":"Статус проекта","content":["Общая информация","Даты"]},{"title":"Выполненные задачи","content":["Список завершённых задач"]},{"title":"Риски и проблемы","content":["Текущие риски","План решения"]}]')
       ON CONFLICT DO NOTHING;
 
-      -- ВСТАВКА 10 ПРЕМИУМ ШАБЛОНОВ
+      -- ПРЕМИУМ ШАБЛОНЫ
       INSERT INTO templates (title, description, category, color1, color2, slide_count, is_premium, is_popular, icon, slides_data) VALUES
       ('Четыре колонки', 'Сравнение 4-х показателей', 'Бизнес', '#1DB954', '#1ED760', 3, true, true, 'view_quilt_rounded', '[{"title":"Сравнительный анализ","content":["Показатель 1","Показатель 2","Показатель 3","Показатель 4"]}]')
       ON CONFLICT DO NOTHING;
@@ -213,7 +277,8 @@ async function initDatabase() {
     `);
     
     console.log('✅ Таблицы созданы/проверены');
-    console.log('✅ 20 шаблонов добавлено (10 бесплатных + 10 премиум)');
+    console.log('✅ 20 шаблонов добавлено');
+    console.log('✅ Командные таблицы созданы');
   } catch (e) {
     console.error('❌ Ошибка создания таблиц:', e.message);
   }
@@ -291,7 +356,7 @@ app.get('/api/health', (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// СОЦИАЛЬНАЯ АВТОРИЗАЦИЯ (НОВЫЙ ЭНДПОИНТ)
+// СОЦИАЛЬНАЯ АВТОРИЗАЦИЯ
 // ═══════════════════════════════════════════════════════════════
 app.post('/api/auth/social', async (req, res) => {
   if (!pool) {
@@ -314,13 +379,9 @@ app.post('/api/auth/social', async (req, res) => {
       return res.status(400).json({ error: 'Недостаточно данных для авторизации' });
     }
 
-    // Формируем уникальный social_id
     const socialId = `${provider}_${id}`;
-    
-    // Генерируем email для соцсетей, которые его не возвращают (VK)
     const userEmail = email || `${id}@${provider}.social.com`;
     
-    // Ищем пользователя по social_id или email
     let result = await pool.query(
       'SELECT * FROM users WHERE social_id = $1 OR email = $2',
       [socialId, userEmail.toLowerCase()]
@@ -329,7 +390,6 @@ app.post('/api/auth/social', async (req, res) => {
     let user;
 
     if (result.rows.length === 0) {
-      // Создаём нового пользователя
       const insertResult = await pool.query(
         `INSERT INTO users (email, name, social_id, social_provider, avatar_url, free_generations_left)
          VALUES ($1, $2, $3, $4, $5, 10)
@@ -337,21 +397,16 @@ app.post('/api/auth/social', async (req, res) => {
         [userEmail.toLowerCase(), name || 'Пользователь', socialId, provider, avatarUrl || null]
       );
       user = insertResult.rows[0];
-      
-      console.log(`✅ Новый пользователь через ${provider}: ${user.name} (${user.email})`);
+      console.log(`✅ Новый пользователь через ${provider}: ${user.name}`);
     } else {
       user = result.rows[0];
-      
-      // Обновляем avatar_url если его нет
       if (!user.avatar_url && avatarUrl) {
         await pool.query('UPDATE users SET avatar_url = $1 WHERE id = $2', [avatarUrl, user.id]);
         user.avatar_url = avatarUrl;
       }
-      
       console.log(`✅ Вход через ${provider}: ${user.name}`);
     }
 
-    // Создаём сессию
     const sessionToken = crypto.randomBytes(48).toString('hex');
     const tokenHash = crypto.createHash('sha256').update(sessionToken).digest('hex');
     
@@ -361,7 +416,6 @@ app.post('/api/auth/social', async (req, res) => {
       [user.id, tokenHash]
     );
 
-    // Отправляем ответ
     res.json({
       token: sessionToken,
       user: {
@@ -385,14 +439,9 @@ app.post('/api/auth/social', async (req, res) => {
 // TEMPLATES API
 // ═══════════════════════════════════════════════════════════════
 
-// GET /api/templates - получить все шаблоны (с фильтрацией по premium)
 app.get('/api/templates', optionalAuth, async (req, res) => {
   if (!pool) {
-    return res.json({ 
-      success: true, 
-      templates: [],
-      message: 'БД не подключена, используйте локальные шаблоны'
-    });
+    return res.json({ success: true, templates: [] });
   }
 
   try {
@@ -400,170 +449,330 @@ app.get('/api/templates', optionalAuth, async (req, res) => {
     const user = req.user;
     
     let query = 'SELECT * FROM templates WHERE 1=1';
-    const params = [];
-    
-    // Если пользователь не premium и не запрошены премиум шаблоны
     const showPremium = include_premium === 'true' && user && user.is_premium;
     if (!showPremium) {
       query += ' AND is_premium = false';
     }
-    
     query += ' ORDER BY is_popular DESC, created_at DESC';
     
-    const result = await pool.query(query, params);
-    
-    res.json({
-      success: true,
-      templates: result.rows,
-      include_premium: showPremium
-    });
+    const result = await pool.query(query);
+    res.json({ success: true, templates: result.rows });
   } catch (error) {
     console.error('Error fetching templates:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// GET /api/templates/free - получить бесплатные шаблоны
 app.get('/api/templates/free', async (req, res) => {
-  if (!pool) {
-    return res.json({ success: true, templates: [] });
-  }
-
+  if (!pool) return res.json({ success: true, templates: [] });
   try {
-    const result = await pool.query(
-      'SELECT * FROM templates WHERE is_premium = false ORDER BY is_popular DESC, created_at DESC'
-    );
-    
-    res.json({
-      success: true,
-      templates: result.rows
-    });
+    const result = await pool.query('SELECT * FROM templates WHERE is_premium = false ORDER BY is_popular DESC, created_at DESC');
+    res.json({ success: true, templates: result.rows });
   } catch (error) {
-    console.error('Error fetching free templates:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// GET /api/templates/premium - получить премиум шаблоны (только для premium пользователей)
 app.get('/api/templates/premium', optionalAuth, async (req, res) => {
-  if (!pool) {
-    return res.json({ success: true, templates: [] });
-  }
-
+  if (!pool) return res.json({ success: true, templates: [] });
   try {
     const user = req.user;
-    
     if (!user || (user.id !== 'guest' && !user.is_premium)) {
       return res.status(403).json({ error: 'Premium доступ только для подписчиков' });
     }
-    
-    const result = await pool.query(
-      'SELECT * FROM templates WHERE is_premium = true ORDER BY is_popular DESC, created_at DESC'
-    );
-    
-    res.json({
-      success: true,
-      templates: result.rows
-    });
+    const result = await pool.query('SELECT * FROM templates WHERE is_premium = true ORDER BY is_popular DESC, created_at DESC');
+    res.json({ success: true, templates: result.rows });
   } catch (error) {
-    console.error('Error fetching premium templates:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// GET /api/templates/:id - получить шаблон по ID
-app.get('/api/templates/:id', async (req, res) => {
-  if (!pool) {
-    return res.status(404).json({ error: 'Template not found' });
-  }
+// ═══════════════════════════════════════════════════════════════
+// WORKSPACES API (КОМАНДНАЯ РАБОТА)
+// ═══════════════════════════════════════════════════════════════
 
-  try {
-    const { id } = req.params;
-    const result = await pool.query('SELECT * FROM templates WHERE id = $1', [id]);
-    
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Template not found' });
-    }
-    
-    res.json({
-      success: true,
-      template: result.rows[0]
-    });
-  } catch (error) {
-    console.error('Error fetching template:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// POST /api/templates - создать новый шаблон
-app.post('/api/templates', optionalAuth, async (req, res) => {
-  if (!pool) {
-    return res.status(503).json({ error: 'Database not available' });
-  }
-
+// GET /api/workspaces - получить все рабочие пространства пользователя
+app.get('/api/workspaces', optionalAuth, async (req, res) => {
+  if (!pool) return res.json({ workspaces: [] });
   try {
     const user = req.user;
+    if (user.id === 'guest') return res.json({ workspaces: [] });
     
-    if (!user || user.id === 'guest') {
-      return res.status(401).json({ error: 'Требуется авторизация' });
-    }
+    const result = await pool.query(`
+      SELECT w.*, 
+        (SELECT COUNT(*) FROM team_members WHERE workspace_id = w.id AND status = 'active') as member_count
+      FROM workspaces w
+      JOIN team_members tm ON w.id = tm.workspace_id
+      WHERE tm.user_id = $1 AND tm.status = 'active'
+    `, [user.id]);
     
-    const { title, description, category, color1, color2, slide_count, icon, slides_data } = req.body;
-    
-    if (!title || !category || !slides_data) {
-      return res.status(400).json({ error: 'Заголовок, категория и данные слайдов обязательны' });
-    }
-    
-    const result = await pool.query(
-      `INSERT INTO templates (title, description, category, color1, color2, slide_count, is_premium, icon, slides_data)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-       RETURNING *`,
-      [title, description, category, color1, color2, slide_count || 1, false, icon, slides_data]
-    );
-    
-    res.json({
-      success: true,
-      template: result.rows[0]
-    });
+    res.json({ workspaces: result.rows });
   } catch (error) {
-    console.error('Error creating template:', error);
+    console.error('Error fetching workspaces:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// DELETE /api/templates/:id - удалить шаблон
-app.delete('/api/templates/:id', optionalAuth, async (req, res) => {
-  if (!pool) {
-    return res.status(503).json({ error: 'Database not available' });
-  }
-
+// POST /api/workspaces - создать новое рабочее пространство
+app.post('/api/workspaces', optionalAuth, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Database not available' });
   try {
     const user = req.user;
+    if (user.id === 'guest') return res.status(401).json({ error: 'Требуется авторизация' });
     
-    if (!user || user.id === 'guest') {
-      return res.status(401).json({ error: 'Требуется авторизация' });
-    }
+    const { name, planType = 'team' } = req.body;
+    if (!name) return res.status(400).json({ error: 'Название обязательно' });
     
-    const { id } = req.params;
+    const result = await pool.query(`
+      INSERT INTO workspaces (name, owner_id, plan_type, max_members)
+      VALUES ($1, $2, $3, CASE WHEN $3 = 'team' THEN 5 WHEN $3 = 'business' THEN 20 ELSE 100 END)
+      RETURNING *
+    `, [name, user.id, planType]);
     
-    const checkResult = await pool.query('SELECT is_premium FROM templates WHERE id = $1', [id]);
-    if (checkResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Template not found' });
-    }
+    const workspace = result.rows[0];
     
-    // Системные шаблоны нельзя удалять
-    if (!checkResult.rows[0].is_premium) {
-      return res.status(403).json({ error: 'Системные шаблоны нельзя удалять' });
-    }
+    await pool.query(`
+      INSERT INTO team_members (workspace_id, user_id, role, status, joined_at)
+      VALUES ($1, $2, 'admin', 'active', NOW())
+    `, [workspace.id, user.id]);
     
-    await pool.query('DELETE FROM templates WHERE id = $1', [id]);
-    
-    res.json({
-      success: true,
-      message: 'Template deleted successfully'
-    });
+    res.json({ workspace });
   } catch (error) {
-    console.error('Error deleting template:', error);
+    console.error('Error creating workspace:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// GET /api/workspaces/:id/members - получить участников команды
+app.get('/api/workspaces/:id/members', optionalAuth, async (req, res) => {
+  if (!pool) return res.json({ members: [] });
+  try {
+    const { id } = req.params;
+    const result = await pool.query(`
+      SELECT tm.*, u.name, u.email, u.avatar_url
+      FROM team_members tm
+      JOIN users u ON tm.user_id = u.id
+      WHERE tm.workspace_id = $1
+    `, [id]);
+    
+    res.json({ members: result.rows });
+  } catch (error) {
+    console.error('Error fetching members:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST /api/workspaces/:id/invite - пригласить участника
+app.post('/api/workspaces/:id/invite', optionalAuth, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Database not available' });
+  try {
+    const user = req.user;
+    const { id } = req.params;
+    const { email, role = 'viewer' } = req.body;
+    
+    if (user.id === 'guest') return res.status(401).json({ error: 'Требуется авторизация' });
+    
+    // Проверяем права
+    const memberCheck = await pool.query(
+      'SELECT role FROM team_members WHERE workspace_id = $1 AND user_id = $2 AND status = $3',
+      [id, user.id, 'active']
+    );
+    
+    if (memberCheck.rows.length === 0 || !['admin', 'editor'].includes(memberCheck.rows[0].role)) {
+      return res.status(403).json({ error: 'Недостаточно прав' });
+    }
+    
+    // Находим пользователя по email
+    const userResult = await pool.query('SELECT id, name, email FROM users WHERE email = $1', [email.toLowerCase()]);
+    
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Пользователь не найден' });
+    }
+    
+    const invitedUser = userResult.rows[0];
+    
+    // Проверяем, не в команде ли уже
+    const existing = await pool.query(
+      'SELECT id FROM team_members WHERE workspace_id = $1 AND user_id = $2',
+      [id, invitedUser.id]
+    );
+    
+    if (existing.rows.length > 0) {
+      return res.status(409).json({ error: 'Пользователь уже в команде' });
+    }
+    
+    await pool.query(`
+      INSERT INTO team_members (workspace_id, user_id, role, invited_by, status)
+      VALUES ($1, $2, $3, $4, 'pending')
+    `, [id, invitedUser.id, role, user.id]);
+    
+    res.json({ success: true, message: `Приглашение отправлено ${invitedUser.email}` });
+  } catch (error) {
+    console.error('Error inviting member:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// PUT /api/workspaces/:id/members/:memberId/role - изменить роль участника
+app.put('/api/workspaces/:id/members/:memberId/role', optionalAuth, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Database not available' });
+  try {
+    const user = req.user;
+    const { id, memberId } = req.params;
+    const { role } = req.body;
+    
+    if (user.id === 'guest') return res.status(401).json({ error: 'Требуется авторизация' });
+    
+    const memberCheck = await pool.query(
+      'SELECT role FROM team_members WHERE workspace_id = $1 AND user_id = $2 AND status = $3',
+      [id, user.id, 'active']
+    );
+    
+    if (memberCheck.rows.length === 0 || memberCheck.rows[0].role !== 'admin') {
+      return res.status(403).json({ error: 'Только администратор может менять роли' });
+    }
+    
+    await pool.query(
+      'UPDATE team_members SET role = $1 WHERE workspace_id = $2 AND user_id = $3',
+      [role, id, memberId]
+    );
+    
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error updating role:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// DELETE /api/workspaces/:id/members/:memberId - удалить участника
+app.delete('/api/workspaces/:id/members/:memberId', optionalAuth, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Database not available' });
+  try {
+    const user = req.user;
+    const { id, memberId } = req.params;
+    
+    if (user.id === 'guest') return res.status(401).json({ error: 'Требуется авторизация' });
+    
+    const memberCheck = await pool.query(
+      'SELECT role FROM team_members WHERE workspace_id = $1 AND user_id = $2 AND status = $3',
+      [id, user.id, 'active']
+    );
+    
+    if (memberCheck.rows.length === 0 || memberCheck.rows[0].role !== 'admin') {
+      return res.status(403).json({ error: 'Только администратор может удалять участников' });
+    }
+    
+    await pool.query(
+      'DELETE FROM team_members WHERE workspace_id = $1 AND user_id = $2',
+      [id, memberId]
+    );
+    
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error removing member:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// GET /api/workspaces/:id/templates - получить общие шаблоны команды
+app.get('/api/workspaces/:id/templates', optionalAuth, async (req, res) => {
+  if (!pool) return res.json({ templates: [] });
+  try {
+    const { id } = req.params;
+    const result = await pool.query(`
+      SELECT tt.*, u.name as created_by_name
+      FROM team_templates tt
+      LEFT JOIN users u ON tt.created_by = u.id
+      WHERE tt.workspace_id = $1
+      ORDER BY tt.is_favorite DESC, tt.used_count DESC
+    `, [id]);
+    
+    res.json({ templates: result.rows });
+  } catch (error) {
+    console.error('Error fetching team templates:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST /api/workspaces/:id/templates - добавить общий шаблон
+app.post('/api/workspaces/:id/templates', optionalAuth, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Database not available' });
+  try {
+    const user = req.user;
+    const { id } = req.params;
+    const { name, slides_data } = req.body;
+    
+    if (user.id === 'guest') return res.status(401).json({ error: 'Требуется авторизация' });
+    
+    const result = await pool.query(`
+      INSERT INTO team_templates (workspace_id, name, slides_data, created_by)
+      VALUES ($1, $2, $3, $4)
+      RETURNING *
+    `, [id, name, slides_data, user.id]);
+    
+    res.json({ template: result.rows[0] });
+  } catch (error) {
+    console.error('Error creating team template:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// COMMENTS API
+// ═══════════════════════════════════════════════════════════════
+
+// GET /api/presentations/:id/comments - получить комментарии к презентации
+app.get('/api/presentations/:id/comments', optionalAuth, async (req, res) => {
+  if (!pool) return res.json({ comments: [] });
+  try {
+    const { id } = req.params;
+    const result = await pool.query(`
+      SELECT c.*, u.name, u.avatar_url
+      FROM comments c
+      JOIN users u ON c.user_id = u.id
+      WHERE c.presentation_id = $1
+      ORDER BY c.created_at ASC
+    `, [id]);
+    
+    res.json({ comments: result.rows });
+  } catch (error) {
+    console.error('Error fetching comments:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST /api/presentations/:id/comments - добавить комментарий
+app.post('/api/presentations/:id/comments', optionalAuth, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Database not available' });
+  try {
+    const user = req.user;
+    const { id } = req.params;
+    const { slide_index, content, parent_id } = req.body;
+    
+    if (user.id === 'guest') return res.status(401).json({ error: 'Требуется авторизация' });
+    
+    const result = await pool.query(`
+      INSERT INTO comments (presentation_id, user_id, slide_index, content, parent_id)
+      VALUES ($1, $2, $3, $4, $5)
+      RETURNING *
+    `, [id, user.id, slide_index, content, parent_id || null]);
+    
+    res.json({ comment: result.rows[0] });
+  } catch (error) {
+    console.error('Error adding comment:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// PUT /api/comments/:id/resolve - отметить комментарий как решённый
+app.put('/api/comments/:id/resolve', optionalAuth, async (req, res) => {
+  if (!pool) return res.status(503).json({ error: 'Database not available' });
+  try {
+    const { id } = req.params;
+    await pool.query('UPDATE comments SET resolved = NOT resolved WHERE id = $1', [id]);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error resolving comment:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -814,8 +1023,9 @@ initDatabase().then(() => {
   app.listen(PORT, () => {
     console.log(`🚀 Сервер на порту ${PORT}`);
     console.log(`📊 БД: ${pool ? 'подключена' : 'DEMO режим'}`);
-    console.log(`📋 Шаблоны: ${pool ? '20 шаблонов загружено' : 'локальные'}`);
+    console.log(`📋 Шаблоны: 20 шаблонов`);
+    console.log(`👥 Командная работа: включена`);
     console.log(`🔐 Социальная авторизация: Google, Apple, VK`);
-    console.log(`🔓 Генерация работает без авторизации (гостевой доступ)`);
+    console.log(`🔓 Генерация работает без авторизации`);
   });
 });
