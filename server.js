@@ -87,6 +87,61 @@ async function optionalAuth(req, res, next) {
   }
 }
 
+function getStandardName(code) {
+  const standards = {
+    'common_core': 'Common Core (USA)',
+    'cambridge': 'Cambridge International',
+    'ib': 'International Baccalaureate (IB)',
+    'fgos': 'ФГОС (Россия)',
+    'national_uk': 'National Curriculum (UK)',
+    'australian': 'Australian Curriculum',
+    'cbse': 'CBSE (India)',
+    'common_eu': 'European Framework'
+  };
+  return standards[code] || code;
+}
+
+function getDefaultStages(topic, durationMinutes) {
+  const stageMinutes = Math.floor(durationMinutes / 5);
+  return [
+    {
+      name: 'Организационный момент',
+      minutes: 5,
+      teacherActions: 'Приветствие, проверка готовности к уроку',
+      studentActions: 'Подготовка рабочих мест',
+      resources: 'Презентация, доска'
+    },
+    {
+      name: 'Актуализация знаний',
+      minutes: stageMinutes,
+      teacherActions: `Опрос по теме "${topic}", введение в новый материал`,
+      studentActions: 'Ответы на вопросы, обсуждение',
+      resources: 'Вопросы для обсуждения, карточки'
+    },
+    {
+      name: 'Изучение нового материала',
+      minutes: stageMinutes * 2,
+      teacherActions: `Объяснение темы "${topic}", демонстрация примеров`,
+      studentActions: 'Конспектирование, задавание вопросов',
+      resources: 'Видеоматериалы, схемы, таблицы'
+    },
+    {
+      name: 'Закрепление материала',
+      minutes: stageMinutes,
+      teacherActions: 'Практические задания, контроль понимания',
+      studentActions: 'Выполнение упражнений, работа в парах',
+      resources: 'Рабочие листы, карточки с заданиями'
+    },
+    {
+      name: 'Подведение итогов',
+      minutes: 5,
+      teacherActions: 'Анализ работы, выставление оценок',
+      studentActions: 'Рефлексия, вопросы по теме',
+      resources: 'Дневники, оценочные листы'
+    }
+  ];
+}
+
 // ═══════════════════════════════════════════════════════════════
 // HEALTH CHECK
 // ═══════════════════════════════════════════════════════════════
@@ -251,11 +306,10 @@ app.post('/api/auth/logout', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// GENERATE — ИСПРАВЛЕННЫЙ (используем slideCount из запроса)
+// GENERATE
 // ═══════════════════════════════════════════════════════════════
 app.post('/api/generate', optionalAuth, async (req, res) => {
   try {
-    // FIX: принимаем slideCount (как во фронтенде) или maxSlides для обратной совместимости
     const { topic, slideCount, maxSlides } = req.body;
     const slidesCount = slideCount || maxSlides || 5;
     
@@ -292,7 +346,6 @@ app.post('/api/generate', optionalAuth, async (req, res) => {
     const cleanText = text.replace(/```json\n?/g, '').replace(/```/g, '').trim();
     const presentation = JSON.parse(cleanText);
     
-    // FIX: гарантируем, что количество слайдов соответствует запрошенному
     if (presentation.slides && presentation.slides.length < slidesCount) {
       const lastSlide = presentation.slides[presentation.slides.length - 1];
       for (let i = presentation.slides.length; i < slidesCount; i++) {
@@ -327,7 +380,9 @@ app.post('/api/generate', optionalAuth, async (req, res) => {
   }
 });
 
-// Improve
+// ═══════════════════════════════════════════════════════════════
+// IMPROVE TEXT
+// ═══════════════════════════════════════════════════════════════
 app.post('/api/improve', optionalAuth, async (req, res) => {
   try {
     const { text } = req.body;
@@ -350,6 +405,183 @@ app.post('/api/improve', optionalAuth, async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════════
+// LESSON PLAN GENERATE (КОНСТРУКТОР УРОКОВ)
+// ═══════════════════════════════════════════════════════════════
+app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
+  try {
+    const { topic, subject, standard, grade, durationMinutes } = req.body;
+    
+    if (!topic || !subject || !grade) {
+      return res.status(400).json({ error: 'Тема, предмет и класс обязательны' });
+    }
+
+    const user = req.user;
+    console.log(`📚 Генерация плана урока: "${topic}" (${subject}, ${grade}, стандарт: ${standard}) - ${user.email}`);
+
+    // Проверка лимита для гостей
+    if (pool && user.id !== 'guest' && !user.is_premium && user.free_generations_left <= 0) {
+      return res.status(402).json({ error: 'Бесплатные генерации закончились' });
+    }
+
+    const standardName = getStandardName(standard);
+    const duration = durationMinutes || 45;
+    
+    const prompt = `Ты — эксперт по педагогике и методист. Создай подробный план урока.
+
+Входные данные:
+- Тема урока: ${topic}
+- Предмет: ${subject}
+- Класс/возраст: ${grade}
+- Образовательный стандарт: ${standardName}
+- Длительность урока: ${duration} минут
+
+Требования:
+1. Укажи 4 конкретные цели урока (измеримые)
+2. Разбей урок на 5 этапов (организационный момент, актуализация знаний, изучение нового материала, закрепление, подведение итогов)
+3. Для каждого этапа укажи время, действия учителя, действия учеников, ресурсы
+4. Дай конкретное домашнее задание по теме
+5. Опиши систему оценивания на уроке
+6. Добавь 4 способа дифференциации (для разных уровней учеников)
+
+Верни ТОЛЬКО JSON без лишнего текста в точном формате:
+{
+  "topic": "${topic}",
+  "subject": "${subject}",
+  "grade": "${grade}",
+  "standard": "${standard}",
+  "duration": "${duration} минут",
+  "objectives": ["Цель 1", "Цель 2", "Цель 3", "Цель 4"],
+  "stages": [
+    {
+      "name": "Организационный момент",
+      "minutes": 5,
+      "teacherActions": "Приветствие, проверка готовности к уроку",
+      "studentActions": "Подготовка рабочих мест",
+      "resources": "Презентация, доска"
+    },
+    {
+      "name": "Актуализация знаний",
+      "minutes": 10,
+      "teacherActions": "Опрос по предыдущей теме, введение в новый материал",
+      "studentActions": "Ответы на вопросы, обсуждение",
+      "resources": "Вопросы для обсуждения"
+    },
+    {
+      "name": "Изучение нового материала",
+      "minutes": 20,
+      "teacherActions": "Объяснение темы, демонстрация примеров",
+      "studentActions": "Конспектирование, задавание вопросов",
+      "resources": "Видеоматериалы, схемы, таблицы"
+    },
+    {
+      "name": "Закрепление материала",
+      "minutes": 7,
+      "teacherActions": "Практические задания, контроль понимания",
+      "studentActions": "Выполнение упражнений, работа в парах",
+      "resources": "Рабочие листы, карточки"
+    },
+    {
+      "name": "Подведение итогов",
+      "minutes": 3,
+      "teacherActions": "Анализ работы, выставление оценок",
+      "studentActions": "Рефлексия, вопросы по теме",
+      "resources": "Дневники, оценочные листы"
+    }
+  ],
+  "homework": "Конкретное домашнее задание по теме",
+  "assessment": "Критерии оценивания на уроке",
+  "differentiation": ["Способ 1", "Способ 2", "Способ 3", "Способ 4"]
+}`;
+
+    const response = await axios.post(YANDEX_URL, {
+      modelUri: `gpt://${YANDEX_FOLDER_ID}/yandexgpt/latest`,
+      completionOptions: { stream: false, temperature: 0.7, maxTokens: "4000" },
+      messages: [{ role: 'user', text: prompt }]
+    }, { 
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Api-Key ${YANDEX_API_KEY}` }, 
+      timeout: 60000 
+    });
+
+    const text = response.data.result.alternatives[0].message.text;
+    const cleanText = text.replace(/```json\n?/g, '').replace(/```/g, '').trim();
+    let lessonPlan = JSON.parse(cleanText);
+    
+    // Валидация и заполнение недостающих полей
+    if (!lessonPlan.objectives || lessonPlan.objectives.length < 3) {
+      lessonPlan.objectives = [
+        `Понять основные концепции темы "${topic}"`,
+        `Научиться применять знания на практике`,
+        `Развить критическое мышление`,
+        `Сформировать навыки работы в группе`
+      ];
+    }
+    
+    if (!lessonPlan.stages || lessonPlan.stages.length < 4) {
+      lessonPlan.stages = getDefaultStages(topic, duration);
+    }
+    
+    if (!lessonPlan.homework) {
+      lessonPlan.homework = `Повторить пройденный материал по теме "${topic}". Выполнить упражнения из учебника. Подготовить сообщение или презентацию по теме.`;
+    }
+    
+    if (!lessonPlan.assessment) {
+      lessonPlan.assessment = 'Фронтальный опрос. Практическая работа. Наблюдение за работой в группах. Самооценка учеников.';
+    }
+    
+    if (!lessonPlan.differentiation || lessonPlan.differentiation.length < 3) {
+      lessonPlan.differentiation = [
+        'Задания разного уровня сложности',
+        'Индивидуальные карточки для слабоуспевающих',
+        'Дополнительные задания для одарённых учеников',
+        'Работа в парах и группах'
+      ];
+    }
+
+    // Уменьшаем счётчик генераций для авторизованных пользователей
+    if (pool && user.id !== 'guest') {
+      await pool.query(
+        'UPDATE users SET free_generations_left = GREATEST(0, free_generations_left - 1), total_generations = total_generations + 1 WHERE id = $1',
+        [user.id]
+      );
+    }
+    
+    console.log(`✅ План урока создан: "${lessonPlan.topic}"`);
+    res.json(lessonPlan);
+    
+  } catch (e) {
+    console.error('❌ Lesson Plan error:', e.message);
+    
+    // Возвращаем корректный fallback
+    const { topic, subject, standard, grade, durationMinutes = 45 } = req.body;
+    res.json({
+      topic: topic || 'План урока',
+      subject: subject || 'Предмет',
+      grade: grade || 'Класс',
+      standard: standard || 'common_core',
+      duration: `${durationMinutes} минут`,
+      objectives: [
+        `Понять основные концепции темы "${topic || 'урока'}"`,
+        `Научиться применять знания на практике`,
+        `Развить критическое мышление`,
+        `Сформировать навыки работы в группе`
+      ],
+      stages: getDefaultStages(topic || 'урока', durationMinutes),
+      homework: `Повторить пройденный материал. Выполнить упражнения из учебника.`,
+      assessment: 'Фронтальный опрос. Практическая работа. Наблюдение.',
+      differentiation: [
+        'Задания разного уровня сложности',
+        'Индивидуальные карточки',
+        'Работа в парах',
+        'Дополнительные задания'
+      ]
+    });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// IMAGES SEARCH
+// ═══════════════════════════════════════════════════════════════
 app.post('/api/images/search', async (req, res) => {
   res.json({ images: [], keywords: req.body.keywords, placeholder: true });
 });
@@ -361,7 +593,7 @@ initDatabase().then(() => {
   app.listen(PORT, () => {
     console.log(`🚀 Сервер на порту ${PORT}`);
     console.log(`📊 БД: ${pool ? 'подключена' : 'DEMO режим'}`);
-    console.log(`🔓 Генерация работает с корректным количеством слайдов`);
+    console.log(`📚 Эндпоинт /api/lesson-plan/generate добавлен`);
   });
 });
 
