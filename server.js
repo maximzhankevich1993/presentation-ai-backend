@@ -176,7 +176,7 @@ app.post('/api/auth/register', async (req, res) => {
   }
 
   try {
-    const { email, password, name } = req.body;
+    const { email, password, name, referralCode } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'Email и пароль обязательны' });
     if (password.length < 6) return res.status(400).json({ error: 'Пароль минимум 6 символов' });
 
@@ -200,6 +200,44 @@ app.post('/api/auth/register', async (req, res) => {
       `INSERT INTO sessions (user_id, token_hash, expires_at) VALUES ($1, $2, NOW() + INTERVAL '30 days')`,
       [user.id, tokenHash]
     );
+
+    // Применяем реферальный код если есть
+    if (referralCode) {
+      try {
+        const referrer = await pool.query(
+          'SELECT user_id FROM referrals WHERE code = $1',
+          [referralCode.toUpperCase()]
+        );
+        
+        if (referrer.rows.length > 0) {
+          const referrerId = referrer.rows[0].user_id;
+          if (referrerId !== user.id) {
+            await pool.query(
+              `INSERT INTO referred_friends (referrer_id, friend_id, status, reward, created_at)
+               VALUES ($1, $2, 'activated', 2, NOW())`,
+              [referrerId, user.id]
+            );
+            
+            await pool.query(
+              `UPDATE referrals 
+               SET referrals_count = referrals_count + 1,
+                   bonus_generations = bonus_generations + 2
+               WHERE user_id = $1`,
+              [referrerId]
+            );
+            
+            await pool.query(
+              `UPDATE users 
+               SET free_generations_left = free_generations_left + 2
+               WHERE id = $1`,
+              [referrerId]
+            );
+          }
+        }
+      } catch (e) {
+        console.log('Referral apply error:', e);
+      }
+    }
 
     try {
       await transporter.sendMail({
@@ -227,7 +265,7 @@ app.post('/api/auth/login', async (req, res) => {
     if (!email || !password) return res.status(400).json({ error: 'Email и пароль обязательны' });
 
     const result = await pool.query(
-      'SELECT id, email, name, password_hash, is_premium, premium_expiry, free_generations_left, failed_login_attempts, locked_until FROM users WHERE email = $1',
+      'SELECT id, email, name, password_hash, is_premium, premium_expiry, free_generations_left, failed_login_attempts, locked_until, is_vip FROM users WHERE email = $1',
       [email.toLowerCase()]
     );
 
@@ -261,7 +299,15 @@ app.post('/api/auth/login', async (req, res) => {
 
     res.json({
       token: sessionToken,
-      user: { id: user.id, email: user.email, name: user.name, isPremium: user.is_premium, premiumExpiry: user.premium_expiry, freeGenerationsLeft: user.free_generations_left }
+      user: { 
+        id: user.id, 
+        email: user.email, 
+        name: user.name, 
+        isPremium: user.is_premium, 
+        premiumExpiry: user.premium_expiry, 
+        freeGenerationsLeft: user.free_generations_left,
+        isVip: user.is_vip
+      }
     });
   } catch (e) {
     console.error('Login:', e);
@@ -329,7 +375,7 @@ app.post('/api/generate', optionalAuth, async (req, res) => {
     const user = req.user;
     console.log(`🎯 Генерация: "${topic}" (${slidesCount} слайдов) - ${user.email}`);
 
-    if (pool && user.id !== 'guest' && !user.is_premium && user.free_generations_left <= 0) {
+    if (pool && user.id !== 'guest' && !user.is_premium && !user.is_vip && user.free_generations_left <= 0) {
       return res.status(402).json({ error: 'Бесплатные генерации закончились' });
     }
 
@@ -367,7 +413,7 @@ app.post('/api/generate', optionalAuth, async (req, res) => {
       }
     }
 
-    if (pool && user.id !== 'guest') {
+    if (pool && user.id !== 'guest' && !user.is_premium && !user.is_vip) {
       await pool.query(
         'UPDATE users SET free_generations_left = GREATEST(0, free_generations_left - 1), total_generations = total_generations + 1 WHERE id = $1',
         [user.id]
@@ -417,7 +463,7 @@ app.post('/api/improve', optionalAuth, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// LESSON PLAN GENERATE (КОНСТРУКТОР УРОКОВ)
+// LESSON PLAN GENERATE
 // ═══════════════════════════════════════════════════════════════
 app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
   try {
@@ -430,7 +476,7 @@ app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
     const user = req.user;
     console.log(`📚 Генерация плана урока: "${topic}" (${subject}, ${grade}, стандарт: ${standard}) - ${user.email}`);
 
-    if (pool && user.id !== 'guest' && !user.is_premium && user.free_generations_left <= 0) {
+    if (pool && user.id !== 'guest' && !user.is_premium && !user.is_vip && user.free_generations_left <= 0) {
       return res.status(402).json({ error: 'Бесплатные генерации закончились' });
     }
 
@@ -446,63 +492,7 @@ app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
 - Образовательный стандарт: ${standardName}
 - Длительность урока: ${duration} минут
 
-Требования:
-1. Укажи 4 конкретные цели урока (измеримые)
-2. Разбей урок на 5 этапов (организационный момент, актуализация знаний, изучение нового материала, закрепление, подведение итогов)
-3. Для каждого этапа укажи время, действия учителя, действия учеников, ресурсы
-4. Дай конкретное домашнее задание по теме
-5. Опиши систему оценивания на уроке
-6. Добавь 4 способа дифференциации (для разных уровней учеников)
-
-Верни ТОЛЬКО JSON без лишнего текста в точном формате:
-{
-  "topic": "${topic}",
-  "subject": "${subject}",
-  "grade": "${grade}",
-  "standard": "${standard}",
-  "duration": "${duration} минут",
-  "objectives": ["Цель 1", "Цель 2", "Цель 3", "Цель 4"],
-  "stages": [
-    {
-      "name": "Организационный момент",
-      "minutes": 5,
-      "teacherActions": "Приветствие, проверка готовности к уроку",
-      "studentActions": "Подготовка рабочих мест",
-      "resources": "Презентация, доска"
-    },
-    {
-      "name": "Актуализация знаний",
-      "minutes": 10,
-      "teacherActions": "Опрос по предыдущей теме, введение в новый материал",
-      "studentActions": "Ответы на вопросы, обсуждение",
-      "resources": "Вопросы для обсуждения"
-    },
-    {
-      "name": "Изучение нового материала",
-      "minutes": 20,
-      "teacherActions": "Объяснение темы, демонстрация примеров",
-      "studentActions": "Конспектирование, задавание вопросов",
-      "resources": "Видеоматериалы, схемы, таблицы"
-    },
-    {
-      "name": "Закрепление материала",
-      "minutes": 7,
-      "teacherActions": "Практические задания, контроль понимания",
-      "studentActions": "Выполнение упражнений, работа в парах",
-      "resources": "Рабочие листы, карточки"
-    },
-    {
-      "name": "Подведение итогов",
-      "minutes": 3,
-      "teacherActions": "Анализ работы, выставление оценок",
-      "studentActions": "Рефлексия, вопросы по теме",
-      "resources": "Дневники, оценочные листы"
-    }
-  ],
-  "homework": "Конкретное домашнее задание по теме",
-  "assessment": "Критерии оценивания на уроке",
-  "differentiation": ["Способ 1", "Способ 2", "Способ 3", "Способ 4"]
-}`;
+Верни ТОЛЬКО JSON.`;
 
     const response = await axios.post(YANDEX_URL, {
       modelUri: `gpt://${YANDEX_FOLDER_ID}/yandexgpt/latest`,
@@ -529,25 +519,8 @@ app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
     if (!lessonPlan.stages || lessonPlan.stages.length < 4) {
       lessonPlan.stages = getDefaultStages(topic, duration);
     }
-    
-    if (!lessonPlan.homework) {
-      lessonPlan.homework = `Повторить пройденный материал по теме "${topic}". Выполнить упражнения из учебника. Подготовить сообщение или презентацию по теме.`;
-    }
-    
-    if (!lessonPlan.assessment) {
-      lessonPlan.assessment = 'Фронтальный опрос. Практическая работа. Наблюдение за работой в группах. Самооценка учеников.';
-    }
-    
-    if (!lessonPlan.differentiation || lessonPlan.differentiation.length < 3) {
-      lessonPlan.differentiation = [
-        'Задания разного уровня сложности',
-        'Индивидуальные карточки для слабоуспевающих',
-        'Дополнительные задания для одарённых учеников',
-        'Работа в парах и группах'
-      ];
-    }
 
-    if (pool && user.id !== 'guest') {
+    if (pool && user.id !== 'guest' && !user.is_premium && !user.is_vip) {
       await pool.query(
         'UPDATE users SET free_generations_left = GREATEST(0, free_generations_left - 1), total_generations = total_generations + 1 WHERE id = $1',
         [user.id]
@@ -559,7 +532,6 @@ app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
     
   } catch (e) {
     console.error('❌ Lesson Plan error:', e.message);
-    
     const { topic, subject, standard, grade, durationMinutes = 45 } = req.body;
     res.json({
       topic: topic || 'План урока',
@@ -574,20 +546,15 @@ app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
         `Сформировать навыки работы в группе`
       ],
       stages: getDefaultStages(topic || 'урока', durationMinutes),
-      homework: `Повторить пройденный материал. Выполнить упражнения из учебника.`,
-      assessment: 'Фронтальный опрос. Практическая работа. Наблюдение.',
-      differentiation: [
-        'Задания разного уровня сложности',
-        'Индивидуальные карточки',
-        'Работа в парах',
-        'Дополнительные задания'
-      ]
+      homework: `Повторить пройденный материал.`,
+      assessment: 'Фронтальный опрос. Практическая работа.',
+      differentiation: ['Задания разного уровня сложности', 'Индивидуальные карточки', 'Работа в парах']
     });
   }
 });
 
 // ═══════════════════════════════════════════════════════════════
-// QUIZ GENERATE (ТЕСТЫ) - ПО ТЕМЕ
+// QUIZ GENERATE
 // ═══════════════════════════════════════════════════════════════
 app.post('/api/quiz/generate', optionalAuth, async (req, res) => {
   try {
@@ -600,9 +567,9 @@ app.post('/api/quiz/generate', optionalAuth, async (req, res) => {
     const user = req.user;
     const qCount = Math.min(Math.max(questionCount || 5, 3), 10);
     
-    console.log(`📝 Генерация теста по теме: "${topic}" (${qCount} вопросов) - ${user.email}`);
+    console.log(`📝 Генерация теста: "${topic}" - ${user.email}`);
     
-    if (pool && user.id !== 'guest' && !user.is_premium && user.free_generations_left <= 0) {
+    if (pool && user.id !== 'guest' && !user.is_premium && !user.is_vip && user.free_generations_left <= 0) {
       return res.status(402).json({ error: 'Бесплатные генерации закончились' });
     }
     
@@ -611,27 +578,8 @@ app.post('/api/quiz/generate', optionalAuth, async (req, res) => {
     
     const prompt = `Ты — эксперт по педагогике. Создай тест по теме "${topic}" для ${grade || 9} класса.${textbookText}
 Страна: ${countryName}
-
 Создай ${qCount} вопросов с 4 вариантами ответов.
-Для каждого вопроса укажи:
-- вопрос
-- 4 варианта ответов (A, B, C, D)
-- правильный ответ (номер 0-3)
-- краткое пояснение
-
-Верни ТОЛЬКО JSON без лишнего текста в формате:
-{
-  "questions": [
-    {
-      "question": "текст вопроса",
-      "options": ["вариант A", "вариант B", "вариант C", "вариант D"],
-      "correct": 0,
-      "explanation": "почему это правильно"
-    }
-  ],
-  "difficulty": "medium",
-  "timeLimitMinutes": ${qCount * 2}
-}`;
+Верни ТОЛЬКО JSON.`;
 
     const response = await axios.post(YANDEX_URL, {
       modelUri: `gpt://${YANDEX_FOLDER_ID}/yandexgpt/latest`,
@@ -646,31 +594,28 @@ app.post('/api/quiz/generate', optionalAuth, async (req, res) => {
     const cleanText = text.replace(/```json\n?/g, '').replace(/```/g, '').trim();
     const quiz = JSON.parse(cleanText);
     
-    if (pool && user.id !== 'guest') {
+    if (pool && user.id !== 'guest' && !user.is_premium && !user.is_vip) {
       await pool.query(
         'UPDATE users SET free_generations_left = GREATEST(0, free_generations_left - 1), total_generations = total_generations + 1 WHERE id = $1',
         [user.id]
       );
     }
     
-    console.log(`✅ Тест по теме создан: "${topic}"`);
+    console.log(`✅ Тест создан: "${topic}"`);
     res.json(quiz);
     
   } catch (error) {
-    console.error('❌ Quiz generation error:', error.message);
-    res.status(500).json({ error: 'Ошибка генерации теста: ' + error.message });
+    console.error('❌ Quiz error:', error.message);
+    res.status(500).json({ error: 'Ошибка генерации теста' });
   }
 });
 
-// ═══════════════════════════════════════════════════════════════
-// QUIZ GENERATE - ИЗ ПРЕЗЕНТАЦИИ
-// ═══════════════════════════════════════════════════════════════
 app.post('/api/quiz/from-presentation', optionalAuth, async (req, res) => {
   try {
     const { title, slides, questionCount } = req.body;
     
     if (!title || !slides || slides.length === 0) {
-      return res.status(400).json({ error: 'Некорректные данные презентации' });
+      return res.status(400).json({ error: 'Некорректные данные' });
     }
     
     const user = req.user;
@@ -678,7 +623,7 @@ app.post('/api/quiz/from-presentation', optionalAuth, async (req, res) => {
     
     console.log(`📝 Генерация теста из презентации: "${title}" - ${user.email}`);
     
-    if (pool && user.id !== 'guest' && !user.is_premium && user.free_generations_left <= 0) {
+    if (pool && user.id !== 'guest' && !user.is_premium && !user.is_vip && user.free_generations_left <= 0) {
       return res.status(402).json({ error: 'Бесплатные генерации закончились' });
     }
     
@@ -688,32 +633,10 @@ app.post('/api/quiz/from-presentation', optionalAuth, async (req, res) => {
       return `Слайд ${i+1}: ${text.substring(0, 500)}`;
     }).join('\n');
     
-    const prompt = `Ты — эксперт по педагогике. На основе содержания презентации "${title}" создай тест.
-
-Содержание презентации:
-${slidesText}
-
-Создай ${qCount} вопросов с 4 вариантами ответов.
-Для каждого вопроса укажи:
-- вопрос
-- 4 варианта ответов (A, B, C, D)
-- правильный ответ (номер 0-3)
-- краткое пояснение
-
-Верни ТОЛЬКО JSON без лишнего текста в формате:
-{
-  "title": "${title}",
-  "questions": [
-    {
-      "question": "текст вопроса",
-      "options": ["вариант A", "вариант B", "вариант C", "вариант D"],
-      "correct": 0,
-      "explanation": "почему это правильно"
-    }
-  ],
-  "difficulty": "medium",
-  "timeLimitMinutes": ${qCount * 2}
-}`;
+    const prompt = `На основе презентации "${title}" создай тест.
+Содержание: ${slidesText}
+Создай ${qCount} вопросов.
+Верни ТОЛЬКО JSON.`;
 
     const response = await axios.post(YANDEX_URL, {
       modelUri: `gpt://${YANDEX_FOLDER_ID}/yandexgpt/latest`,
@@ -728,7 +651,7 @@ ${slidesText}
     const cleanText = text.replace(/```json\n?/g, '').replace(/```/g, '').trim();
     const quiz = JSON.parse(cleanText);
     
-    if (pool && user.id !== 'guest') {
+    if (pool && user.id !== 'guest' && !user.is_premium && !user.is_vip) {
       await pool.query(
         'UPDATE users SET free_generations_left = GREATEST(0, free_generations_left - 1), total_generations = total_generations + 1 WHERE id = $1',
         [user.id]
@@ -740,15 +663,14 @@ ${slidesText}
     
   } catch (error) {
     console.error('❌ Quiz from presentation error:', error.message);
-    res.status(500).json({ error: 'Ошибка генерации теста из презентации: ' + error.message });
+    res.status(500).json({ error: 'Ошибка генерации' });
   }
 });
 
 // ═══════════════════════════════════════════════════════════════
-// REFERRAL SYSTEM (РЕФЕРАЛЬНАЯ ПРОГРАММА)
+// REFERRAL SYSTEM
 // ═══════════════════════════════════════════════════════════════
 
-// Получить статистику рефералов
 app.get('/api/referral/stats', optionalAuth, async (req, res) => {
   try {
     const user = req.user;
@@ -783,12 +705,7 @@ app.get('/api/referral/stats', optionalAuth, async (req, res) => {
     }
     
     const friends = await pool.query(
-      `SELECT 
-        u.name, 
-        u.email, 
-        r.created_at as date,
-        r.status,
-        r.reward
+      `SELECT u.name, u.email, r.created_at as date, r.status, r.reward
        FROM referred_friends r
        JOIN users u ON u.id = r.friend_id
        WHERE r.referrer_id = $1
@@ -811,17 +728,16 @@ app.get('/api/referral/stats', optionalAuth, async (req, res) => {
     
   } catch (error) {
     console.error('❌ Referral stats error:', error);
-    res.status(500).json({ error: 'Ошибка загрузки реферальной статистики' });
+    res.status(500).json({ error: 'Ошибка загрузки' });
   }
 });
 
-// Применить реферальный код при регистрации
 app.post('/api/referral/apply', async (req, res) => {
   try {
     const { code, userId } = req.body;
     
     if (!code || !userId) {
-      return res.status(400).json({ error: 'Код и ID пользователя обязательны' });
+      return res.status(400).json({ error: 'Код и ID обязательны' });
     }
     
     if (!pool) {
@@ -854,8 +770,8 @@ app.post('/api/referral/apply', async (req, res) => {
     
     await pool.query(
       `INSERT INTO referred_friends (referrer_id, friend_id, status, reward, created_at)
-       VALUES ($1, $2, $3, $4, NOW())`,
-      [referrerId, userId, 'pending', null]
+       VALUES ($1, $2, 'pending', NULL, NOW())`,
+      [referrerId, userId]
     );
     
     res.json({ success: true });
@@ -866,7 +782,6 @@ app.post('/api/referral/apply', async (req, res) => {
   }
 });
 
-// Активировать реферал (когда друг зарегистрировался)
 app.post('/api/referral/activate', optionalAuth, async (req, res) => {
   try {
     const { friendId } = req.body;
@@ -906,11 +821,10 @@ app.post('/api/referral/activate', optionalAuth, async (req, res) => {
     
   } catch (error) {
     console.error('❌ Activate referral error:', error);
-    res.status(500).json({ error: 'Ошибка активации реферала' });
+    res.status(500).json({ error: 'Ошибка активации' });
   }
 });
 
-// Активировать реферал при покупке Premium
 app.post('/api/referral/premium-activated', optionalAuth, async (req, res) => {
   try {
     const user = req.user;
@@ -932,23 +846,17 @@ app.post('/api/referral/premium-activated', optionalAuth, async (req, res) => {
       const referrerId = referral.rows[0].referrer_id;
       
       await pool.query(
-        `UPDATE referred_friends 
-         SET status = 'premium_activated', reward = 10
-         WHERE friend_id = $1`,
+        `UPDATE referred_friends SET status = 'premium_activated', reward = 10 WHERE friend_id = $1`,
         [user.id]
       );
       
       await pool.query(
-        `UPDATE referrals 
-         SET bonus_generations = bonus_generations + 10
-         WHERE user_id = $1`,
+        `UPDATE referrals SET bonus_generations = bonus_generations + 10 WHERE user_id = $1`,
         [referrerId]
       );
       
       await pool.query(
-        `UPDATE users 
-         SET free_generations_left = free_generations_left + 10
-         WHERE id = $1`,
+        `UPDATE users SET free_generations_left = free_generations_left + 10 WHERE id = $1`,
         [referrerId]
       );
     }
@@ -956,8 +864,89 @@ app.post('/api/referral/premium-activated', optionalAuth, async (req, res) => {
     res.json({ success: true });
     
   } catch (error) {
-    console.error('❌ Premium activated referral error:', error);
-    res.status(500).json({ error: 'Ошибка активации реферала' });
+    console.error('❌ Premium activated error:', error);
+    res.status(500).json({ error: 'Ошибка активации' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// VIP STATS
+// ═══════════════════════════════════════════════════════════════
+app.get('/api/vip/stats', optionalAuth, async (req, res) => {
+  try {
+    if (!pool) {
+      return res.status(503).json({ error: 'База данных недоступна' });
+    }
+    
+    const result = await pool.query(
+      'SELECT COUNT(*) as count FROM users WHERE is_vip = true'
+    );
+    
+    const occupiedSpots = parseInt(result.rows[0]?.count || 0);
+    const totalSpots = 50;
+    
+    res.json({
+      occupiedSpots: occupiedSpots,
+      totalSpots: totalSpots,
+      availableSpots: totalSpots - occupiedSpots,
+    });
+  } catch (error) {
+    console.error('❌ VIP stats error:', error);
+    res.status(500).json({ error: 'Ошибка загрузки' });
+  }
+});
+
+app.post('/api/vip/purchase', optionalAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    
+    if (user.id === 'guest') {
+      return res.status(401).json({ error: 'Требуется авторизация' });
+    }
+    
+    if (!pool) {
+      return res.status(503).json({ error: 'База данных недоступна' });
+    }
+    
+    const countResult = await pool.query(
+      'SELECT COUNT(*) as count FROM users WHERE is_vip = true'
+    );
+    
+    const occupiedSpots = parseInt(countResult.rows[0]?.count || 0);
+    const totalSpots = 50;
+    
+    if (occupiedSpots >= totalSpots) {
+      return res.status(400).json({ error: 'Все VIP места заняты' });
+    }
+    
+    const userCheck = await pool.query(
+      'SELECT is_vip FROM users WHERE id = $1',
+      [user.id]
+    );
+    
+    if (userCheck.rows[0]?.is_vip) {
+      return res.status(400).json({ error: 'Вы уже VIP' });
+    }
+    
+    await pool.query(
+      `UPDATE users 
+       SET is_vip = true, 
+           vip_activated_at = NOW(),
+           is_premium = true,
+           premium_expiry = NULL
+       WHERE id = $1`,
+      [user.id]
+    );
+    
+    res.json({ 
+      success: true, 
+      message: 'VIP статус активирован',
+      occupiedSpots: occupiedSpots + 1,
+      availableSpots: totalSpots - (occupiedSpots + 1),
+    });
+  } catch (error) {
+    console.error('❌ VIP purchase error:', error);
+    res.status(500).json({ error: 'Ошибка активации VIP' });
   }
 });
 
@@ -975,7 +964,7 @@ initDatabase().then(() => {
   app.listen(PORT, () => {
     console.log(`🚀 Сервер на порту ${PORT}`);
     console.log(`📊 БД: ${pool ? 'подключена' : 'DEMO режим'}`);
-    console.log(`📚 Эндпоинты: /api/generate, /api/lesson-plan/generate, /api/quiz/generate, /api/quiz/from-presentation, /api/referral/stats`);
+    console.log(`📚 Все эндпоинты загружены`);
   });
 });
 
@@ -1005,7 +994,9 @@ async function initDatabase() {
         updated_at TIMESTAMPTZ DEFAULT NOW(),
         social_id VARCHAR(255) UNIQUE,
         social_provider VARCHAR(50),
-        avatar_url TEXT
+        avatar_url TEXT,
+        is_vip BOOLEAN DEFAULT FALSE,
+        vip_activated_at TIMESTAMPTZ
       );
 
       CREATE INDEX IF NOT EXISTS idx_users_social_id ON users(social_id);
@@ -1051,8 +1042,6 @@ async function initDatabase() {
 
       CREATE INDEX IF NOT EXISTS idx_presentations_user ON presentations(user_id);
 
-      -- ⭐ РЕФЕРАЛЬНЫЕ ТАБЛИЦЫ ⭐
-      
       CREATE TABLE IF NOT EXISTS referrals (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
         user_id UUID REFERENCES users(id) ON DELETE CASCADE,
@@ -1087,19 +1076,12 @@ async function initDatabase() {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════
-// ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-// ═══════════════════════════════════════════════════════════════
-
 async function _generateUniqueReferralCode(userId) {
   const prefix = 'REF';
   const suffix = userId.substring(0, 6).toUpperCase();
   let code = `${prefix}${suffix}`;
   
-  const existing = await pool.query(
-    'SELECT id FROM referrals WHERE code = $1',
-    [code]
-  );
+  const existing = await pool.query('SELECT id FROM referrals WHERE code = $1', [code]);
   
   if (existing.rows.length > 0) {
     const random = Math.floor(Math.random() * 1000);
