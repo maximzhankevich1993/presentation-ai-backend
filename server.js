@@ -101,6 +101,17 @@ function getStandardName(code) {
   return standards[code] || code;
 }
 
+function getCountryNameForQuiz(code) {
+  const countries = {
+    'RU': 'Россия', 'BY': 'Беларусь', 'KZ': 'Казахстан',
+    'UA': 'Украина', 'US': 'США', 'GB': 'Великобритания',
+    'DE': 'Германия', 'FR': 'Франция', 'IT': 'Италия',
+    'ES': 'Испания', 'PL': 'Польша', 'TR': 'Турция',
+    'CN': 'Китай', 'IN': 'Индия', 'BR': 'Бразилия'
+  };
+  return countries[code] || 'международный';
+}
+
 function getDefaultStages(topic, durationMinutes) {
   const stageMinutes = Math.floor(durationMinutes / 5);
   return [
@@ -419,7 +430,6 @@ app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
     const user = req.user;
     console.log(`📚 Генерация плана урока: "${topic}" (${subject}, ${grade}, стандарт: ${standard}) - ${user.email}`);
 
-    // Проверка лимита для гостей
     if (pool && user.id !== 'guest' && !user.is_premium && user.free_generations_left <= 0) {
       return res.status(402).json({ error: 'Бесплатные генерации закончились' });
     }
@@ -507,7 +517,6 @@ app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
     const cleanText = text.replace(/```json\n?/g, '').replace(/```/g, '').trim();
     let lessonPlan = JSON.parse(cleanText);
     
-    // Валидация и заполнение недостающих полей
     if (!lessonPlan.objectives || lessonPlan.objectives.length < 3) {
       lessonPlan.objectives = [
         `Понять основные концепции темы "${topic}"`,
@@ -538,7 +547,6 @@ app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
       ];
     }
 
-    // Уменьшаем счётчик генераций для авторизованных пользователей
     if (pool && user.id !== 'guest') {
       await pool.query(
         'UPDATE users SET free_generations_left = GREATEST(0, free_generations_left - 1), total_generations = total_generations + 1 WHERE id = $1',
@@ -552,7 +560,6 @@ app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
   } catch (e) {
     console.error('❌ Lesson Plan error:', e.message);
     
-    // Возвращаем корректный fallback
     const { topic, subject, standard, grade, durationMinutes = 45 } = req.body;
     res.json({
       topic: topic || 'План урока',
@@ -580,98 +587,156 @@ app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// IMAGES SEARCH
+// QUIZ GENERATE (ТЕСТЫ) - ПО ТЕМЕ
 // ═══════════════════════════════════════════════════════════════
-app.post('/api/images/search', async (req, res) => {
-  res.json({ images: [], keywords: req.body.keywords, placeholder: true });
-});
-
-// ═══════════════════════════════════════════════════════════════
-// START
-// ═══════════════════════════════════════════════════════════════
-initDatabase().then(() => {
-  app.listen(PORT, () => {
-    console.log(`🚀 Сервер на порту ${PORT}`);
-    console.log(`📊 БД: ${pool ? 'подключена' : 'DEMO режим'}`);
-    console.log(`📚 Эндпоинт /api/lesson-plan/generate добавлен`);
-  });
-});
-
-async function initDatabase() {
-  if (!pool) return;
+app.post('/api/quiz/generate', optionalAuth, async (req, res) => {
   try {
-    await pool.query(`
-      CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
-
-      CREATE TABLE IF NOT EXISTS users (
-        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-        email VARCHAR(255) UNIQUE NOT NULL,
-        password_hash VARCHAR(255),
-        name VARCHAR(255),
-        country VARCHAR(10),
-        is_premium BOOLEAN DEFAULT FALSE,
-        premium_expiry TIMESTAMPTZ,
-        free_generations_left INTEGER DEFAULT 10,
-        total_generations INTEGER DEFAULT 0,
-        surprise_uses_left INTEGER DEFAULT 3,
-        email_verified BOOLEAN DEFAULT FALSE,
-        verification_token VARCHAR(255),
-        last_login TIMESTAMPTZ,
-        failed_login_attempts INTEGER DEFAULT 0,
-        locked_until TIMESTAMPTZ,
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        updated_at TIMESTAMPTZ DEFAULT NOW(),
-        social_id VARCHAR(255) UNIQUE,
-        social_provider VARCHAR(50),
-        avatar_url TEXT
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_users_social_id ON users(social_id);
-      CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
-
-      CREATE TABLE IF NOT EXISTS sessions (
-        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-        token_hash VARCHAR(255) UNIQUE NOT NULL,
-        ip_address VARCHAR(45),
-        user_agent TEXT,
-        expires_at TIMESTAMPTZ NOT NULL,
-        created_at TIMESTAMPTZ DEFAULT NOW()
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token_hash);
-      CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
-
-      CREATE TABLE IF NOT EXISTS password_resets (
-        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-        token_hash VARCHAR(255) NOT NULL,
-        expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '1 hour',
-        used BOOLEAN DEFAULT FALSE,
-        created_at TIMESTAMPTZ DEFAULT NOW()
-      );
-
-      CREATE TABLE IF NOT EXISTS presentations (
-        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-        title VARCHAR(500) NOT NULL,
-        slides_data JSONB NOT NULL DEFAULT '[]',
-        slide_count INTEGER DEFAULT 0,
-        font_pair VARCHAR(100),
-        theme_id VARCHAR(100),
-        transition_type VARCHAR(50) DEFAULT 'fade',
-        is_public BOOLEAN DEFAULT FALSE,
-        views INTEGER DEFAULT 0,
-        likes INTEGER DEFAULT 0,
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        updated_at TIMESTAMPTZ DEFAULT NOW()
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_presentations_user ON presentations(user_id);
-    `);
+    const { topic, textbook, grade, questionCount, countryCode } = req.body;
     
-    console.log('✅ Таблицы созданы/проверены');
-  } catch (e) {
-    console.error('❌ Ошибка создания таблиц:', e.message);
+    if (!topic) {
+      return res.status(400).json({ error: 'Тема не указана' });
+    }
+    
+    const user = req.user;
+    const qCount = Math.min(Math.max(questionCount || 5, 3), 10);
+    
+    console.log(`📝 Генерация теста по теме: "${topic}" (${qCount} вопросов) - ${user.email}`);
+    
+    if (pool && user.id !== 'guest' && !user.is_premium && user.free_generations_left <= 0) {
+      return res.status(402).json({ error: 'Бесплатные генерации закончились' });
+    }
+    
+    const countryName = getCountryNameForQuiz(countryCode || 'RU');
+    const textbookText = textbook ? `\nУчебник: ${textbook}` : '';
+    
+    const prompt = `Ты — эксперт по педагогике. Создай тест по теме "${topic}" для ${grade || 9} класса.${textbookText}
+Страна: ${countryName}
+
+Создай ${qCount} вопросов с 4 вариантами ответов.
+Для каждого вопроса укажи:
+- вопрос
+- 4 варианта ответов (A, B, C, D)
+- правильный ответ (номер 0-3)
+- краткое пояснение
+
+Верни ТОЛЬКО JSON без лишнего текста в формате:
+{
+  "questions": [
+    {
+      "question": "текст вопроса",
+      "options": ["вариант A", "вариант B", "вариант C", "вариант D"],
+      "correct": 0,
+      "explanation": "почему это правильно"
+    }
+  ],
+  "difficulty": "medium",
+  "timeLimitMinutes": ${qCount * 2}
+}`;
+
+    const response = await axios.post(YANDEX_URL, {
+      modelUri: `gpt://${YANDEX_FOLDER_ID}/yandexgpt/latest`,
+      completionOptions: { stream: false, temperature: 0.7, maxTokens: "3000" },
+      messages: [{ role: 'user', text: prompt }]
+    }, { 
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Api-Key ${YANDEX_API_KEY}` }, 
+      timeout: 60000 
+    });
+
+    const text = response.data.result.alternatives[0].message.text;
+    const cleanText = text.replace(/```json\n?/g, '').replace(/```/g, '').trim();
+    const quiz = JSON.parse(cleanText);
+    
+    if (pool && user.id !== 'guest') {
+      await pool.query(
+        'UPDATE users SET free_generations_left = GREATEST(0, free_generations_left - 1), total_generations = total_generations + 1 WHERE id = $1',
+        [user.id]
+      );
+    }
+    
+    console.log(`✅ Тест по теме создан: "${topic}"`);
+    res.json(quiz);
+    
+  } catch (error) {
+    console.error('❌ Quiz generation error:', error.message);
+    res.status(500).json({ error: 'Ошибка генерации теста: ' + error.message });
   }
-}
+});
+
+// ═══════════════════════════════════════════════════════════════
+// QUIZ GENERATE - ИЗ ПРЕЗЕНТАЦИИ
+// ═══════════════════════════════════════════════════════════════
+app.post('/api/quiz/from-presentation', optionalAuth, async (req, res) => {
+  try {
+    const { title, slides, questionCount } = req.body;
+    
+    if (!title || !slides || slides.length === 0) {
+      return res.status(400).json({ error: 'Некорректные данные презентации' });
+    }
+    
+    const user = req.user;
+    const qCount = Math.min(Math.max(questionCount || 5, 3), 10);
+    
+    console.log(`📝 Генерация теста из презентации: "${title}" - ${user.email}`);
+    
+    if (pool && user.id !== 'guest' && !user.is_premium && user.free_generations_left <= 0) {
+      return res.status(402).json({ error: 'Бесплатные генерации закончились' });
+    }
+    
+    const relevantSlides = slides.slice(0, Math.min(5, slides.length));
+    const slidesText = relevantSlides.map((s, i) => {
+      const text = typeof s === 'string' ? s : (s.title + ' ' + (s.content || []).join(' '));
+      return `Слайд ${i+1}: ${text.substring(0, 500)}`;
+    }).join('\n');
+    
+    const prompt = `Ты — эксперт по педагогике. На основе содержания презентации "${title}" создай тест.
+
+Содержание презентации:
+${slidesText}
+
+Создай ${qCount} вопросов с 4 вариантами ответов.
+Для каждого вопроса укажи:
+- вопрос
+- 4 варианта ответов (A, B, C, D)
+- правильный ответ (номер 0-3)
+- краткое пояснение
+
+Верни ТОЛЬКО JSON без лишнего текста в формате:
+{
+  "title": "${title}",
+  "questions": [
+    {
+      "question": "текст вопроса",
+      "options": ["вариант A", "вариант B", "вариант C", "вариант D"],
+      "correct": 0,
+      "explanation": "почему это правильно"
+    }
+  ],
+  "difficulty": "medium",
+  "timeLimitMinutes": ${qCount * 2}
+}`;
+
+    const response = await axios.post(YANDEX_URL, {
+      modelUri: `gpt://${YANDEX_FOLDER_ID}/yandexgpt/latest`,
+      completionOptions: { stream: false, temperature: 0.7, maxTokens: "3000" },
+      messages: [{ role: 'user', text: prompt }]
+    }, { 
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Api-Key ${YANDEX_API_KEY}` }, 
+      timeout: 60000 
+    });
+
+    const text = response.data.result.alternatives[0].message.text;
+    const cleanText = text.replace(/```json\n?/g, '').replace(/```/g, '').trim();
+    const quiz = JSON.parse(cleanText);
+    
+    if (pool && user.id !== 'guest') {
+      await pool.query(
+        'UPDATE users SET free_generations_left = GREATEST(0, free_generations_left - 1), total_generations = total_generations + 1 WHERE id = $1',
+        [user.id]
+      );
+    }
+    
+    console.log(`✅ Тест из презентации создан: "${title}"`);
+    res.json(quiz);
+    
+  } catch (error) {
+    console.error
