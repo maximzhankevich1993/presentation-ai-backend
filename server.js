@@ -739,4 +739,104 @@ ${slidesText}
     res.json(quiz);
     
   } catch (error) {
-    console.error
+    console.error('❌ Quiz from presentation error:', error.message);
+    res.status(500).json({ error: 'Ошибка генерации теста из презентации: ' + error.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// IMAGES SEARCH
+// ═══════════════════════════════════════════════════════════════
+app.post('/api/images/search', async (req, res) => {
+  res.json({ images: [], keywords: req.body.keywords, placeholder: true });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// START
+// ═══════════════════════════════════════════════════════════════
+initDatabase().then(() => {
+  app.listen(PORT, () => {
+    console.log(`🚀 Сервер на порту ${PORT}`);
+    console.log(`📊 БД: ${pool ? 'подключена' : 'DEMO режим'}`);
+    console.log(`📚 Эндпоинты: /api/generate, /api/lesson-plan/generate, /api/quiz/generate, /api/quiz/from-presentation`);
+  });
+});
+
+async function initDatabase() {
+  if (!pool) return;
+  try {
+    await pool.query(`
+      CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+      CREATE TABLE IF NOT EXISTS users (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        email VARCHAR(255) UNIQUE NOT NULL,
+        password_hash VARCHAR(255),
+        name VARCHAR(255),
+        country VARCHAR(10),
+        is_premium BOOLEAN DEFAULT FALSE,
+        premium_expiry TIMESTAMPTZ,
+        free_generations_left INTEGER DEFAULT 10,
+        total_generations INTEGER DEFAULT 0,
+        surprise_uses_left INTEGER DEFAULT 3,
+        email_verified BOOLEAN DEFAULT FALSE,
+        verification_token VARCHAR(255),
+        last_login TIMESTAMPTZ,
+        failed_login_attempts INTEGER DEFAULT 0,
+        locked_until TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        social_id VARCHAR(255) UNIQUE,
+        social_provider VARCHAR(50),
+        avatar_url TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_users_social_id ON users(social_id);
+      CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+
+      CREATE TABLE IF NOT EXISTS sessions (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        token_hash VARCHAR(255) UNIQUE NOT NULL,
+        ip_address VARCHAR(45),
+        user_agent TEXT,
+        expires_at TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token_hash);
+      CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+
+      CREATE TABLE IF NOT EXISTS password_resets (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        token_hash VARCHAR(255) NOT NULL,
+        expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '1 hour',
+        used BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS presentations (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        title VARCHAR(500) NOT NULL,
+        slides_data JSONB NOT NULL DEFAULT '[]',
+        slide_count INTEGER DEFAULT 0,
+        font_pair VARCHAR(100),
+        theme_id VARCHAR(100),
+        transition_type VARCHAR(50) DEFAULT 'fade',
+        is_public BOOLEAN DEFAULT FALSE,
+        views INTEGER DEFAULT 0,
+        likes INTEGER DEFAULT 0,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_presentations_user ON presentations(user_id);
+    `);
+    
+    console.log('✅ Таблицы созданы/проверены');
+  } catch (e) {
+    console.error('❌ Ошибка создания таблиц:', e.message);
+  }
+}
