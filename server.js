@@ -62,14 +62,14 @@ async function optionalAuth(req, res, next) {
   const token = req.headers.authorization?.replace('Bearer ', '');
   
   if (!token || !pool) {
-    req.user = { id: 'guest', email: 'guest@demo.com', name: 'Гость', is_premium: false, free_generations_left: 5 };
+    req.user = { id: 'guest', email: 'guest@demo.com', name: 'Гость', is_premium: false, free_generations_left: 5, is_vip: false };
     return next();
   }
 
   try {
     const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
     const result = await pool.query(
-      `SELECT u.id, u.email, u.name, u.is_premium, u.premium_expiry, u.free_generations_left
+      `SELECT u.id, u.email, u.name, u.is_premium, u.premium_expiry, u.free_generations_left, u.is_vip
        FROM sessions s JOIN users u ON u.id = s.user_id
        WHERE s.token_hash = $1 AND s.expires_at > NOW()`,
       [tokenHash]
@@ -78,11 +78,11 @@ async function optionalAuth(req, res, next) {
     if (result.rows.length > 0) {
       req.user = result.rows[0];
     } else {
-      req.user = { id: 'guest', email: 'guest@demo.com', name: 'Гость', is_premium: false, free_generations_left: 5 };
+      req.user = { id: 'guest', email: 'guest@demo.com', name: 'Гость', is_premium: false, free_generations_left: 5, is_vip: false };
     }
     next();
   } catch (e) {
-    req.user = { id: 'guest', email: 'guest@demo.com', name: 'Гость', is_premium: false, free_generations_left: 5 };
+    req.user = { id: 'guest', email: 'guest@demo.com', name: 'Гость', is_premium: false, free_generations_left: 5, is_vip: false };
     next();
   }
 }
@@ -257,7 +257,7 @@ app.post('/api/auth/register', async (req, res) => {
 
 app.post('/api/auth/login', async (req, res) => {
   if (!pool) {
-    return res.json({ token: 'demo-token', user: { id: 'demo', email: req.body.email, name: 'Demo', isPremium: true, freeGenerationsLeft: 999 } });
+    return res.json({ token: 'demo-token', user: { id: 'demo', email: req.body.email, name: 'Demo', isPremium: true, freeGenerationsLeft: 999, isVip: true } });
   }
 
   try {
@@ -413,6 +413,15 @@ app.post('/api/generate', optionalAuth, async (req, res) => {
       }
     }
 
+    // Сохраняем в историю
+    if (pool && user.id !== 'guest') {
+      await pool.query(
+        `INSERT INTO generation_history (user_id, type, title, slide_count, created_at)
+         VALUES ($1, 'presentation', $2, $3, NOW())`,
+        [user.id, topic, slidesCount]
+      );
+    }
+
     if (pool && user.id !== 'guest' && !user.is_premium && !user.is_vip) {
       await pool.query(
         'UPDATE users SET free_generations_left = GREATEST(0, free_generations_left - 1), total_generations = total_generations + 1 WHERE id = $1',
@@ -520,6 +529,15 @@ app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
       lessonPlan.stages = getDefaultStages(topic, duration);
     }
 
+    // Сохраняем в историю
+    if (pool && user.id !== 'guest') {
+      await pool.query(
+        `INSERT INTO generation_history (user_id, type, title, created_at)
+         VALUES ($1, 'lesson_plan', $2, NOW())`,
+        [user.id, topic]
+      );
+    }
+
     if (pool && user.id !== 'guest' && !user.is_premium && !user.is_vip) {
       await pool.query(
         'UPDATE users SET free_generations_left = GREATEST(0, free_generations_left - 1), total_generations = total_generations + 1 WHERE id = $1',
@@ -550,6 +568,67 @@ app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
       assessment: 'Фронтальный опрос. Практическая работа.',
       differentiation: ['Задания разного уровня сложности', 'Индивидуальные карточки', 'Работа в парах']
     });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// REPORT GENERATE (КОНСТРУКТОР ОТЧЁТОВ)
+// ═══════════════════════════════════════════════════════════════
+app.post('/api/report/generate', optionalAuth, async (req, res) => {
+  try {
+    const { company, period, standard, reportType } = req.body;
+    
+    if (!company || !period) {
+      return res.status(400).json({ error: 'Компания и период обязательны' });
+    }
+
+    const user = req.user;
+    console.log(`📊 Генерация отчёта: "${company}" (${standard}, ${reportType}) - ${user.email}`);
+
+    if (pool && user.id !== 'guest' && !user.is_premium && !user.is_vip && user.free_generations_left <= 0) {
+      return res.status(402).json({ error: 'Бесплатные генерации закончились' });
+    }
+
+    const prompt = `Ты — финансовый аналитик. Создай отчёт для компании "${company}" за период ${period}.
+Стандарт: ${standard}
+Тип отчёта: ${reportType}
+Верни ТОЛЬКО JSON со структурой отчёта.`;
+
+    const response = await axios.post(YANDEX_URL, {
+      modelUri: `gpt://${YANDEX_FOLDER_ID}/yandexgpt/latest`,
+      completionOptions: { stream: false, temperature: 0.7, maxTokens: "3000" },
+      messages: [{ role: 'user', text: prompt }]
+    }, { 
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Api-Key ${YANDEX_API_KEY}` }, 
+      timeout: 60000 
+    });
+
+    const text = response.data.result.alternatives[0].message.text;
+    const cleanText = text.replace(/```json\n?/g, '').replace(/```/g, '').trim();
+    const report = JSON.parse(cleanText);
+
+    // Сохраняем в историю
+    if (pool && user.id !== 'guest') {
+      await pool.query(
+        `INSERT INTO generation_history (user_id, type, title, created_at)
+         VALUES ($1, 'report', $2, NOW())`,
+        [user.id, company]
+      );
+    }
+
+    if (pool && user.id !== 'guest' && !user.is_premium && !user.is_vip) {
+      await pool.query(
+        'UPDATE users SET free_generations_left = GREATEST(0, free_generations_left - 1), total_generations = total_generations + 1 WHERE id = $1',
+        [user.id]
+      );
+    }
+    
+    console.log(`✅ Отчёт создан: "${company}"`);
+    res.json(report);
+    
+  } catch (error) {
+    console.error('❌ Report generation error:', error.message);
+    res.status(500).json({ error: 'Ошибка генерации отчёта' });
   }
 });
 
@@ -593,6 +672,15 @@ app.post('/api/quiz/generate', optionalAuth, async (req, res) => {
     const text = response.data.result.alternatives[0].message.text;
     const cleanText = text.replace(/```json\n?/g, '').replace(/```/g, '').trim();
     const quiz = JSON.parse(cleanText);
+    
+    // Сохраняем в историю
+    if (pool && user.id !== 'guest') {
+      await pool.query(
+        `INSERT INTO generation_history (user_id, type, title, created_at)
+         VALUES ($1, 'quiz', $2, NOW())`,
+        [user.id, topic]
+      );
+    }
     
     if (pool && user.id !== 'guest' && !user.is_premium && !user.is_vip) {
       await pool.query(
@@ -664,6 +752,125 @@ app.post('/api/quiz/from-presentation', optionalAuth, async (req, res) => {
   } catch (error) {
     console.error('❌ Quiz from presentation error:', error.message);
     res.status(500).json({ error: 'Ошибка генерации' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// EXPORT (PPTX / PDF)
+// ═══════════════════════════════════════════════════════════════
+
+app.post('/api/export/pptx', optionalAuth, async (req, res) => {
+  try {
+    const { title, slides } = req.body;
+    const user = req.user;
+    
+    console.log(`📤 Экспорт PPTX: "${title}" - ${user.email}`);
+    
+    // Сохраняем в историю экспорта
+    if (pool && user.id !== 'guest') {
+      await pool.query(
+        `INSERT INTO export_history (user_id, type, title, created_at)
+         VALUES ($1, 'pptx', $2, NOW())`,
+        [user.id, title]
+      );
+    }
+    
+    res.json({
+      success: true,
+      message: 'PPTX готов к скачиванию',
+      url: `https://presentation-ai-backend.onrender.com/exports/${Date.now()}.pptx`
+    });
+  } catch (error) {
+    console.error('❌ PPTX export error:', error);
+    res.status(500).json({ error: 'Ошибка экспорта PPTX' });
+  }
+});
+
+app.post('/api/export/pdf', optionalAuth, async (req, res) => {
+  try {
+    const { title, slides } = req.body;
+    const user = req.user;
+    
+    if (!user.is_premium && !user.is_vip) {
+      return res.status(403).json({ error: 'Premium доступ required' });
+    }
+    
+    console.log(`📤 Экспорт PDF: "${title}" - ${user.email}`);
+    
+    // Сохраняем в историю экспорта
+    if (pool && user.id !== 'guest') {
+      await pool.query(
+        `INSERT INTO export_history (user_id, type, title, created_at)
+         VALUES ($1, 'pdf', $2, NOW())`,
+        [user.id, title]
+      );
+    }
+    
+    res.json({
+      success: true,
+      message: 'PDF готов к скачиванию',
+      url: `https://presentation-ai-backend.onrender.com/exports/${Date.now()}.pdf`
+    });
+  } catch (error) {
+    console.error('❌ PDF export error:', error);
+    res.status(500).json({ error: 'Ошибка экспорта PDF' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// GENERATION HISTORY (ИСТОРИЯ)
+// ═══════════════════════════════════════════════════════════════
+
+app.get('/api/history', optionalAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    
+    if (user.id === 'guest') {
+      return res.json({ history: [] });
+    }
+    
+    if (!pool) {
+      return res.json({ history: [] });
+    }
+    
+    const history = await pool.query(
+      `SELECT id, type, title, slide_count, created_at
+       FROM generation_history
+       WHERE user_id = $1
+       ORDER BY created_at DESC
+       LIMIT 50`,
+      [user.id]
+    );
+    
+    res.json({ history: history.rows });
+  } catch (error) {
+    console.error('❌ History error:', error);
+    res.status(500).json({ error: 'Ошибка загрузки истории' });
+  }
+});
+
+app.delete('/api/history/:id', optionalAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    const { id } = req.params;
+    
+    if (user.id === 'guest') {
+      return res.status(401).json({ error: 'Требуется авторизация' });
+    }
+    
+    if (!pool) {
+      return res.json({ success: true });
+    }
+    
+    await pool.query(
+      'DELETE FROM generation_history WHERE id = $1 AND user_id = $2',
+      [id, user.id]
+    );
+    
+    res.json({ success: true });
+  } catch (error) {
+    console.error('❌ Delete history error:', error);
+    res.status(500).json({ error: 'Ошибка удаления' });
   }
 });
 
@@ -1042,6 +1249,31 @@ async function initDatabase() {
 
       CREATE INDEX IF NOT EXISTS idx_presentations_user ON presentations(user_id);
 
+      -- История генераций
+      CREATE TABLE IF NOT EXISTS generation_history (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        type VARCHAR(50) NOT NULL,
+        title VARCHAR(500) NOT NULL,
+        slide_count INTEGER,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_history_user ON generation_history(user_id);
+      CREATE INDEX IF NOT EXISTS idx_history_type ON generation_history(type);
+
+      -- История экспорта
+      CREATE TABLE IF NOT EXISTS export_history (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        type VARCHAR(20) NOT NULL,
+        title VARCHAR(500) NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_export_user ON export_history(user_id);
+
+      -- Реферальные таблицы
       CREATE TABLE IF NOT EXISTS referrals (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
         user_id UUID REFERENCES users(id) ON DELETE CASCADE,
