@@ -745,6 +745,223 @@ ${slidesText}
 });
 
 // ═══════════════════════════════════════════════════════════════
+// REFERRAL SYSTEM (РЕФЕРАЛЬНАЯ ПРОГРАММА)
+// ═══════════════════════════════════════════════════════════════
+
+// Получить статистику рефералов
+app.get('/api/referral/stats', optionalAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    
+    if (user.id === 'guest') {
+      return res.status(401).json({ error: 'Требуется авторизация' });
+    }
+    
+    if (!pool) {
+      return res.json({
+        code: `REF${user.id?.substring(0, 6)?.toUpperCase() || 'GUEST'}`,
+        referralsCount: 0,
+        bonusGenerations: 0,
+        friends: [],
+      });
+    }
+    
+    let referral = await pool.query(
+      'SELECT code, referrals_count, bonus_generations FROM referrals WHERE user_id = $1',
+      [user.id]
+    );
+    
+    let referralCode;
+    if (referral.rows.length === 0) {
+      referralCode = await _generateUniqueReferralCode(user.id);
+      await pool.query(
+        'INSERT INTO referrals (user_id, code, referrals_count, bonus_generations) VALUES ($1, $2, $3, $4)',
+        [user.id, referralCode, 0, 0]
+      );
+    } else {
+      referralCode = referral.rows[0].code;
+    }
+    
+    const friends = await pool.query(
+      `SELECT 
+        u.name, 
+        u.email, 
+        r.created_at as date,
+        r.status,
+        r.reward
+       FROM referred_friends r
+       JOIN users u ON u.id = r.friend_id
+       WHERE r.referrer_id = $1
+       ORDER BY r.created_at DESC`,
+      [user.id]
+    );
+    
+    res.json({
+      code: referralCode,
+      referralsCount: referral.rows[0]?.referrals_count || 0,
+      bonusGenerations: referral.rows[0]?.bonus_generations || 0,
+      friends: friends.rows.map(f => ({
+        name: f.name || f.email?.split('@')[0] || 'Пользователь',
+        email: f.email,
+        date: _formatDate(f.date),
+        status: f.status,
+        reward: f.reward,
+      })),
+    });
+    
+  } catch (error) {
+    console.error('❌ Referral stats error:', error);
+    res.status(500).json({ error: 'Ошибка загрузки реферальной статистики' });
+  }
+});
+
+// Применить реферальный код при регистрации
+app.post('/api/referral/apply', async (req, res) => {
+  try {
+    const { code, userId } = req.body;
+    
+    if (!code || !userId) {
+      return res.status(400).json({ error: 'Код и ID пользователя обязательны' });
+    }
+    
+    if (!pool) {
+      return res.json({ success: true });
+    }
+    
+    const referrer = await pool.query(
+      'SELECT user_id FROM referrals WHERE code = $1',
+      [code.toUpperCase()]
+    );
+    
+    if (referrer.rows.length === 0) {
+      return res.status(404).json({ error: 'Неверный реферальный код' });
+    }
+    
+    const referrerId = referrer.rows[0].user_id;
+    
+    if (referrerId === userId) {
+      return res.status(400).json({ error: 'Нельзя использовать свой код' });
+    }
+    
+    const existing = await pool.query(
+      'SELECT id FROM referred_friends WHERE friend_id = $1',
+      [userId]
+    );
+    
+    if (existing.rows.length > 0) {
+      return res.status(400).json({ error: 'Код уже был применен' });
+    }
+    
+    await pool.query(
+      `INSERT INTO referred_friends (referrer_id, friend_id, status, reward, created_at)
+       VALUES ($1, $2, $3, $4, NOW())`,
+      [referrerId, userId, 'pending', null]
+    );
+    
+    res.json({ success: true });
+    
+  } catch (error) {
+    console.error('❌ Apply referral error:', error);
+    res.status(500).json({ error: 'Ошибка применения кода' });
+  }
+});
+
+// Активировать реферал (когда друг зарегистрировался)
+app.post('/api/referral/activate', optionalAuth, async (req, res) => {
+  try {
+    const { friendId } = req.body;
+    const user = req.user;
+    
+    if (user.id === 'guest') {
+      return res.status(401).json({ error: 'Требуется авторизация' });
+    }
+    
+    if (!pool) {
+      return res.json({ success: true });
+    }
+    
+    await pool.query(
+      `UPDATE referred_friends 
+       SET status = 'activated', reward = 2, activated_at = NOW()
+       WHERE friend_id = $1 AND referrer_id = $2`,
+      [friendId, user.id]
+    );
+    
+    await pool.query(
+      `UPDATE referrals 
+       SET referrals_count = referrals_count + 1,
+           bonus_generations = bonus_generations + 2
+       WHERE user_id = $1`,
+      [user.id]
+    );
+    
+    await pool.query(
+      `UPDATE users 
+       SET free_generations_left = free_generations_left + 2
+       WHERE id = $1`,
+      [user.id]
+    );
+    
+    res.json({ success: true });
+    
+  } catch (error) {
+    console.error('❌ Activate referral error:', error);
+    res.status(500).json({ error: 'Ошибка активации реферала' });
+  }
+});
+
+// Активировать реферал при покупке Premium
+app.post('/api/referral/premium-activated', optionalAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    
+    if (user.id === 'guest') {
+      return res.status(401).json({ error: 'Требуется авторизация' });
+    }
+    
+    if (!pool) {
+      return res.json({ success: true });
+    }
+    
+    const referral = await pool.query(
+      'SELECT referrer_id FROM referred_friends WHERE friend_id = $1',
+      [user.id]
+    );
+    
+    if (referral.rows.length > 0) {
+      const referrerId = referral.rows[0].referrer_id;
+      
+      await pool.query(
+        `UPDATE referred_friends 
+         SET status = 'premium_activated', reward = 10
+         WHERE friend_id = $1`,
+        [user.id]
+      );
+      
+      await pool.query(
+        `UPDATE referrals 
+         SET bonus_generations = bonus_generations + 10
+         WHERE user_id = $1`,
+        [referrerId]
+      );
+      
+      await pool.query(
+        `UPDATE users 
+         SET free_generations_left = free_generations_left + 10
+         WHERE id = $1`,
+        [referrerId]
+      );
+    }
+    
+    res.json({ success: true });
+    
+  } catch (error) {
+    console.error('❌ Premium activated referral error:', error);
+    res.status(500).json({ error: 'Ошибка активации реферала' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
 // IMAGES SEARCH
 // ═══════════════════════════════════════════════════════════════
 app.post('/api/images/search', async (req, res) => {
@@ -758,7 +975,7 @@ initDatabase().then(() => {
   app.listen(PORT, () => {
     console.log(`🚀 Сервер на порту ${PORT}`);
     console.log(`📊 БД: ${pool ? 'подключена' : 'DEMO режим'}`);
-    console.log(`📚 Эндпоинты: /api/generate, /api/lesson-plan/generate, /api/quiz/generate, /api/quiz/from-presentation`);
+    console.log(`📚 Эндпоинты: /api/generate, /api/lesson-plan/generate, /api/quiz/generate, /api/quiz/from-presentation, /api/referral/stats`);
   });
 });
 
@@ -833,10 +1050,74 @@ async function initDatabase() {
       );
 
       CREATE INDEX IF NOT EXISTS idx_presentations_user ON presentations(user_id);
+
+      -- ⭐ РЕФЕРАЛЬНЫЕ ТАБЛИЦЫ ⭐
+      
+      CREATE TABLE IF NOT EXISTS referrals (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        code VARCHAR(50) UNIQUE NOT NULL,
+        referrals_count INTEGER DEFAULT 0,
+        bonus_generations INTEGER DEFAULT 0,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_referrals_user ON referrals(user_id);
+      CREATE INDEX IF NOT EXISTS idx_referrals_code ON referrals(code);
+
+      CREATE TABLE IF NOT EXISTS referred_friends (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        referrer_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        friend_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        status VARCHAR(20) DEFAULT 'pending',
+        reward INTEGER,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        activated_at TIMESTAMPTZ,
+        UNIQUE(friend_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_referred_friends_referrer ON referred_friends(referrer_id);
+      CREATE INDEX IF NOT EXISTS idx_referred_friends_friend ON referred_friends(friend_id);
     `);
     
     console.log('✅ Таблицы созданы/проверены');
   } catch (e) {
     console.error('❌ Ошибка создания таблиц:', e.message);
   }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+// ═══════════════════════════════════════════════════════════════
+
+async function _generateUniqueReferralCode(userId) {
+  const prefix = 'REF';
+  const suffix = userId.substring(0, 6).toUpperCase();
+  let code = `${prefix}${suffix}`;
+  
+  const existing = await pool.query(
+    'SELECT id FROM referrals WHERE code = $1',
+    [code]
+  );
+  
+  if (existing.rows.length > 0) {
+    const random = Math.floor(Math.random() * 1000);
+    code = `${prefix}${suffix}${random}`;
+  }
+  
+  return code;
+}
+
+function _formatDate(date) {
+  if (!date) return '';
+  const now = new Date();
+  const diff = now - new Date(date);
+  const days = Math.floor(diff / (1000 * 60 * 60 * 24));
+  
+  if (days === 0) return 'сегодня';
+  if (days === 1) return 'вчера';
+  if (days < 7) return `${days} дня назад`;
+  if (days < 30) return `${Math.floor(days / 7)} недели назад`;
+  return `${Math.floor(days / 30)} месяца назад`;
 }
