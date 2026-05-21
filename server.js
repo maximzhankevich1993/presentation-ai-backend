@@ -14,20 +14,32 @@ if (process.env.NODE_ENV !== 'production') {
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+app.use(express.json({ limit: '10mb' }));
 app.use(helmet());
 app.use(cors({ 
   origin: '*', 
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'], 
   allowedHeaders: ['Content-Type', 'Authorization'] 
 }));
-app.use(express.json({ limit: '1mb' }));
 
 // ═══════════════════════════════════════════════════════════════
 // DATABASE
 // ═══════════════════════════════════════════════════════════════
 const pool = process.env.DATABASE_URL 
-  ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } })
+  ? new Pool({ 
+      connectionString: process.env.DATABASE_URL, 
+      ssl: { rejectUnauthorized: false },
+      max: 20,
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 10000,
+    })
   : null;
+
+// ═══════════════════════════════════════════════════════════════
+// КЭШ ДЛЯ ПОВТОРНЫХ ЗАПРОСОВ
+// ═══════════════════════════════════════════════════════════════
+const generationCache = new Map();
+const CACHE_TTL = 1000 * 60 * 60; // 1 час
 
 // ═══════════════════════════════════════════════════════════════
 // YANDEX GPT
@@ -162,12 +174,13 @@ app.get('/api/health', (req, res) => {
     timestamp: new Date().toISOString(), 
     version: '7.0.0', 
     api: 'YandexGPT',
-    db: !!pool
+    db: !!pool,
+    uptime: process.uptime()
   });
 });
 
 // ═══════════════════════════════════════════════════════════════
-// AUTH - ИСПРАВЛЕННЫЙ ЛОГИН (убрана колонка is_vip)
+// AUTH
 // ═══════════════════════════════════════════════════════════════
 
 app.post('/api/auth/register', async (req, res) => {
@@ -188,7 +201,7 @@ app.post('/api/auth/register', async (req, res) => {
 
     const result = await pool.query(
       `INSERT INTO users (email, password_hash, name, verification_token, free_generations_left)
-       VALUES ($1, $2, $3, $4, 10) RETURNING id, email, name`,
+       VALUES ($1, $2, $3, $4, 5) RETURNING id, email, name`,
       [email.toLowerCase(), passwordHash, name || email.split('@')[0], verificationToken]
     );
 
@@ -243,11 +256,11 @@ app.post('/api/auth/register', async (req, res) => {
         from: `"Презентатор ИИ" <${FROM_EMAIL}>`,
         to: email,
         subject: 'Добро пожаловать! 🎉',
-        html: `<h2>Добро пожаловать, ${user.name}!</h2><p>🎁 10 бесплатных генераций уже ждут вас.</p>`
+        html: `<h2>Добро пожаловать, ${user.name}!</h2><p>🎁 5 бесплатных генераций уже ждут вас.</p>`
       });
     } catch (_) {}
 
-    res.json({ token: sessionToken, user: { id: user.id, email: user.email, name: user.name, isPremium: false, freeGenerationsLeft: 10 } });
+    res.json({ token: sessionToken, user: { id: user.id, email: user.email, name: user.name, isPremium: false, freeGenerationsLeft: 5 } });
   } catch (e) {
     console.error('Register:', e);
     res.status(500).json({ error: 'Ошибка регистрации' });
@@ -267,9 +280,8 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(400).json({ error: 'Email и пароль обязательны' });
     }
 
-    // Убрал is_vip из запроса
     const result = await pool.query(
-      'SELECT id, email, name, password_hash, is_premium, premium_expiry, free_generations_left, failed_login_attempts, locked_until FROM users WHERE email = $1',
+      'SELECT id, email, name, password_hash, is_premium, premium_expiry, free_generations_left, failed_login_attempts, locked_until, is_vip FROM users WHERE email = $1',
       [email.toLowerCase()]
     );
 
@@ -281,12 +293,10 @@ app.post('/api/auth/login', async (req, res) => {
     const user = result.rows[0];
     console.log('✅ Пользователь найден:', user.email);
 
-    // Проверка блокировки
     if (user.locked_until && new Date(user.locked_until) > new Date()) {
       return res.status(423).json({ error: 'Аккаунт заблокирован' });
     }
 
-    // Проверка пароля
     const valid = await bcrypt.compare(password, user.password_hash);
     if (!valid) {
       console.log('❌ Неверный пароль');
@@ -299,13 +309,11 @@ app.post('/api/auth/login', async (req, res) => {
 
     console.log('✅ Пароль верный');
 
-    // Сброс попыток и обновление last_login
     await pool.query(
       'UPDATE users SET failed_login_attempts = 0, locked_until = NULL, last_login = NOW() WHERE id = $1',
       [user.id]
     );
 
-    // Создание сессии
     const sessionToken = crypto.randomBytes(48).toString('hex');
     const tokenHash = crypto.createHash('sha256').update(sessionToken).digest('hex');
     
@@ -327,8 +335,8 @@ app.post('/api/auth/login', async (req, res) => {
         name: user.name, 
         isPremium: user.is_premium || false, 
         premiumExpiry: user.premium_expiry, 
-        freeGenerationsLeft: user.free_generations_left || 10,
-        isVip: false
+        freeGenerationsLeft: user.free_generations_left || 5,
+        isVip: user.is_vip || false
       }
     });
   } catch (e) {
@@ -385,7 +393,7 @@ app.post('/api/auth/logout', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// GENERATE (ПРЕЗЕНТАЦИИ)
+// GENERATE (ПРЕЗЕНТАЦИИ) - С УВЕЛИЧЕННЫМ ОБЪЁМОМ ТЕКСТА (45-60 слов)
 // ═══════════════════════════════════════════════════════════════
 app.post('/api/generate', optionalAuth, async (req, res) => {
   try {
@@ -395,49 +403,70 @@ app.post('/api/generate', optionalAuth, async (req, res) => {
     if (!topic) return res.status(400).json({ error: 'Тема не указана' });
 
     const user = req.user;
+    const cacheKey = `${topic.toLowerCase()}_${slidesCount}`;
+    
+    // Проверка кэша
+    if (generationCache.has(cacheKey)) {
+      const cached = generationCache.get(cacheKey);
+      console.log(`📦 Кэш: "${topic}" - ${user.email}`);
+      return res.json(cached);
+    }
+
     console.log(`🎯 Генерация: "${topic}" (${slidesCount} слайдов) - ${user.email}`);
 
     if (pool && user.id !== 'guest' && !user.is_premium && !user.is_vip && user.free_generations_left <= 0) {
       return res.status(402).json({ error: 'Бесплатные генерации закончились' });
     }
 
-    const isComplex = topic.length > 30 || /сложн|технолог|инновац|квант|нейросет|искусствен|алгоритм|моделировани/i.test(topic);
-    const minWords = isComplex ? 18 : 10;
-    const maxWords = isComplex ? 30 : 20;
-    
+    const minWords = 45;
+    const maxWords = 60;
+
     const prompt = `Ты — эксперт по созданию презентаций. Создай структуру презентации на тему: "${topic}". Количество слайдов: ${slidesCount}.
 
 ПРАВИЛА:
 - Каждый слайд: ЗАГОЛОВОК (5-8 слов) + 4-6 пунктов
-- Длина каждого пункта: ${minWords}-${maxWords} слов
+- Длина КАЖДОГО пункта: ${minWords}-${maxWords} слов (ОБЯЗАТЕЛЬНО 45-60 слов!)
+- Используй: цифры, проценты, даты, статистику, примеры из реальной жизни, цитаты экспертов
+
+СТРУКТУРА КАЖДОГО ПУНКТА (50 слов):
+1. Вводная фраза (5-10 слов)
+2. Основной тезис с цифрами (15-20 слов)
+3. Пример или доказательство (15-20 слов)
+4. Вывод или рекомендация (10-15 слов)
+
+ПРИМЕР хорошего пункта (50 слов):
+"Согласно исследованию компании Gartner за 2024 год, 73% крупных предприятий уже внедрили AI-решения в свои бизнес-процессы. Например, корпорация Microsoft сократила операционные расходы на 28% в первый год использования AI. Эксперты прогнозируют рост мирового рынка AI до 500 миллиардов долларов к 2026 году. Рекомендуется начать внедрение с пилотного проекта для оценки эффективности."
 
 Верни ТОЛЬКО JSON в формате:
 {
   "title": "Название презентации",
   "slides": [
     {
-      "title": "Заголовок слайда",
-      "content": ["пункт 1", "пункт 2", "пункт 3", "пункт 4"]
+      "title": "Заголовок слайда (5-8 слов)",
+      "content": [
+        "Развёрнутый пункт 1 (45-60 слов). Обязательно добавь цифры и факты...",
+        "Развёрнутый пункт 2 (45-60 слов). Продолжи с детальным анализом...",
+        "Развёрнутый пункт 3 (45-60 слов). Добавь практические примеры...",
+        "Развёрнутый пункт 4 (45-60 слов). Заверши выводом или рекомендацией..."
+      ]
     }
   ]
 }`;
 
     const response = await axios.post(YANDEX_URL, {
       modelUri: `gpt://${YANDEX_FOLDER_ID}/yandexgpt/latest`,
-      completionOptions: { stream: false, temperature: 0.7, maxTokens: "4000" },
+      completionOptions: { stream: false, temperature: 0.7, maxTokens: "8000" },
       messages: [{ role: 'user', text: prompt }]
     }, { 
       headers: { 'Content-Type': 'application/json', 'Authorization': `Api-Key ${YANDEX_API_KEY}` }, 
-      timeout: 60000 
+      timeout: 120000 
     });
 
     let text = response.data.result.alternatives[0].message.text;
     let cleanText = text.replace(/```json\n?/g, '').replace(/```/g, '').trim();
     
     const jsonMatch = cleanText.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      cleanText = jsonMatch[0];
-    }
+    if (jsonMatch) cleanText = jsonMatch[0];
     
     let presentation = JSON.parse(cleanText);
     
@@ -446,17 +475,20 @@ app.post('/api/generate', optionalAuth, async (req, res) => {
     }
     
     while (presentation.slides.length < slidesCount) {
-      const lastSlide = presentation.slides[presentation.slides.length - 1];
       presentation.slides.push({
-        title: lastSlide?.title || `Часть ${presentation.slides.length + 1}`,
+        title: `Слайд ${presentation.slides.length + 1}`,
         content: [
-          `Ключевой аспект ${presentation.slides.length + 1} темы "${topic}" требует детального рассмотрения.`,
-          `Анализ показывает, что данный фактор влияет на общий результат на 15-20%.`,
-          `Практические примеры подтверждают эффективность данного подхода.`,
+          `Ключевой аспект темы "${topic}" требует детального рассмотрения. Анализ показывает, что данное направление активно развивается.`,
+          `Статистика подтверждает важность этого вопроса для современного бизнеса и общества.`,
+          `Практические примеры демонстрируют эффективность предложенных решений.`,
           `Рекомендуется учитывать эти данные при принятии стратегических решений.`
         ]
       });
     }
+    
+    // Сохраняем в кэш
+    generationCache.set(cacheKey, presentation);
+    setTimeout(() => generationCache.delete(cacheKey), CACHE_TTL);
     
     if (pool && user.id !== 'guest') {
       await pool.query(
@@ -482,12 +514,12 @@ app.post('/api/generate', optionalAuth, async (req, res) => {
     const slides = [];
     for (let i = 0; i < slidesCount; i++) {
       slides.push({
-        title: i === 0 ? `Введение в тему "${req.body.topic}"` : i === slidesCount - 1 ? 'Заключение и выводы' : `Ключевой аспект ${i + 1}`,
+        title: i === 0 ? `Введение в тему "${req.body.topic}"` : i === slidesCount - 1 ? 'Заключение' : `Аспект ${i + 1}`,
         content: [
-          `Данный аспект темы "${req.body.topic}" требует внимательного анализа.`,
-          `Статистика показывает, что это направление активно развивается.`,
-          `Эксперты рекомендуют учитывать эти факторы при планировании.`,
-          `Практические примеры демонстрируют эффективность данного подхода.`
+          `Ключевой момент темы "${req.body.topic}" требует внимательного анализа и понимания.`,
+          `Анализ показывает важность этого направления для развития в современных условиях.`,
+          `Практические примеры подтверждают эффективность данного подхода на практике.`,
+          `Рекомендации для дальнейшего изучения и внедрения полученных результатов.`
         ]
       });
     }
@@ -503,7 +535,7 @@ app.post('/api/improve', optionalAuth, async (req, res) => {
     const { text } = req.body;
     if (!text) return res.status(400).json({ error: 'Текст не указан' });
 
-    const prompt = `Улучши текст для презентации. Сделай его более профессиональным и информативным. Исходный текст: "${text}". Верни только улучшенный текст.`;
+    const prompt = `Улучши текст для презентации. Сделай его более профессиональным и информативным. Добавь цифры и факты если возможно. Исходный текст: "${text}". Верни только улучшенный текст, без пояснений.`;
 
     const response = await axios.post(YANDEX_URL, {
       modelUri: `gpt://${YANDEX_FOLDER_ID}/yandexgpt/latest`,
@@ -511,7 +543,7 @@ app.post('/api/improve', optionalAuth, async (req, res) => {
       messages: [{ role: 'user', text: prompt }]
     }, { 
       headers: { 'Content-Type': 'application/json', 'Authorization': `Api-Key ${YANDEX_API_KEY}` }, 
-      timeout: 20000 
+      timeout: 30000 
     });
 
     const improved = response.data.result.alternatives[0].message.text.trim();
@@ -546,19 +578,19 @@ app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
       standard: standard || 'common_core',
       duration: `${durationMinutes} минут`,
       objectives: [
-        `Понять основные концепции темы "${topic}" и уметь их объяснять.`,
-        `Научиться применять полученные знания на практике.`,
-        `Развить навыки анализа и синтеза информации.`,
-        `Сформировать умение работать в группе и презентовать результаты.`
+        `Понять основные концепции темы "${topic}" и уметь их объяснять своими словами.`,
+        `Научиться применять полученные знания на практике с примерами из реальной жизни.`,
+        `Развить навыки анализа и синтеза информации по данной теме.`,
+        `Сформировать умение работать в группе и презентовать результаты работы.`
       ],
       stages: getDefaultStages(topic, durationMinutes),
-      homework: `Повторить тему "${topic}". Подготовить краткое сообщение.`,
-      assessment: 'Фронтальный опрос, практическая работа, самооценка.',
+      homework: `Повторить тему "${topic}". Подготовить краткое сообщение на 5-7 предложений. Выполнить практические задания из учебника.`,
+      assessment: 'Фронтальный опрос по ключевым понятиям. Практическая работа с проверкой. Оценка групповой работы. Самооценка учеников.',
       differentiation: [
-        'Задания разного уровня сложности.',
-        'Индивидуальные карточки-помощники.',
-        'Дополнительные задания для мотивированных учеников.',
-        'Работа в парах и малых группах.'
+        'Задания разного уровня сложности с возможностью выбора.',
+        'Индивидуальные карточки-помощники для слабоуспевающих учеников.',
+        'Дополнительные исследовательские задания для мотивированных учеников.',
+        'Работа в парах и малых группах для взаимопомощи.'
       ]
     });
   } catch (e) {
@@ -573,9 +605,7 @@ app.post('/api/quiz/generate', optionalAuth, async (req, res) => {
   try {
     const { topic, questionCount = 5 } = req.body;
     
-    if (!topic) {
-      return res.status(400).json({ error: 'Тема не указана' });
-    }
+    if (!topic) return res.status(400).json({ error: 'Тема не указана' });
     
     const user = req.user;
     const qCount = Math.min(Math.max(questionCount, 3), 10);
@@ -592,7 +622,7 @@ app.post('/api/quiz/generate', optionalAuth, async (req, res) => {
         question: `Вопрос ${i + 1} по теме "${topic}"?`,
         options: ['Вариант А', 'Вариант Б', 'Вариант В', 'Вариант Г'],
         correct: 0,
-        explanation: `Пояснение к вопросу ${i + 1}.`
+        explanation: `Пояснение к вопросу ${i + 1} по теме "${topic}".`
       });
     }
     
@@ -632,7 +662,7 @@ app.post('/api/quiz/from-presentation', optionalAuth, async (req, res) => {
         question: `Вопрос по презентации "${title}"?`,
         options: ['Вариант А', 'Вариант Б', 'Вариант В', 'Вариант Г'],
         correct: 0,
-        explanation: `Пояснение на основе слайда ${(i % slides.length) + 1}.`
+        explanation: `Пояснение на основе презентации "${title}".`
       });
     }
     
@@ -672,8 +702,8 @@ app.post('/api/report/generate', optionalAuth, async (req, res) => {
       slides: [
         { title: 'Титульный лист', content: [company, `Отчёт за ${period}`, `Стандарт: ${standard || 'МСФО'}`] },
         { title: 'Ключевые показатели', content: ['Выручка: 100 млн ₽', 'Прибыль: 25 млн ₽', 'Рентабельность: 25%'] },
-        { title: 'Анализ', content: ['Анализ деятельности компании показывает положительную динамику.'] },
-        { title: 'Выводы и рекомендации', content: ['Рекомендуется продолжить развитие в выбранном направлении.'] }
+        { title: 'Анализ', content: ['Анализ деятельности компании показывает положительную динамику всех основных показателей.'] },
+        { title: 'Выводы и рекомендации', content: ['Рекомендуется продолжить развитие в выбранном направлении и усилить маркетинговую активность.'] }
       ]
     });
   } catch (e) {
@@ -688,7 +718,7 @@ app.post('/api/export/pptx', optionalAuth, async (req, res) => {
   try {
     const { title } = req.body;
     console.log(`📤 Экспорт PPTX: "${title}"`);
-    res.json({ success: true, message: 'PPTX готов', url: `https://presentation-ai-backend.onrender.com/exports/${Date.now()}.pptx` });
+    res.json({ success: true, message: 'PPTX готов' });
   } catch (error) {
     res.status(500).json({ error: 'Ошибка экспорта PPTX' });
   }
@@ -704,14 +734,14 @@ app.post('/api/export/pdf', optionalAuth, async (req, res) => {
     }
     
     console.log(`📤 Экспорт PDF: "${title}"`);
-    res.json({ success: true, message: 'PDF готов', url: `https://presentation-ai-backend.onrender.com/exports/${Date.now()}.pdf` });
+    res.json({ success: true, message: 'PDF готов' });
   } catch (error) {
     res.status(500).json({ error: 'Ошибка экспорта PDF' });
   }
 });
 
 // ═══════════════════════════════════════════════════════════════
-// HISTORY, REFERRAL, VIP, IMAGES (упрощённые)
+// HISTORY, REFERRAL, VIP, IMAGES
 // ═══════════════════════════════════════════════════════════════
 app.get('/api/history', optionalAuth, async (req, res) => {
   res.json({ history: [] });
@@ -767,7 +797,7 @@ async function initDatabase() {
         country VARCHAR(10),
         is_premium BOOLEAN DEFAULT FALSE,
         premium_expiry TIMESTAMPTZ,
-        free_generations_left INTEGER DEFAULT 10,
+        free_generations_left INTEGER DEFAULT 5,
         total_generations INTEGER DEFAULT 0,
         surprise_uses_left INTEGER DEFAULT 3,
         email_verified BOOLEAN DEFAULT FALSE,
@@ -795,6 +825,7 @@ async function initDatabase() {
       );
 
       CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token_hash);
+      CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
 
       CREATE TABLE IF NOT EXISTS generation_history (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -811,10 +842,21 @@ async function initDatabase() {
   }
 }
 
+// Пинг для предотвращения холодного старта
+setInterval(async () => {
+  try {
+    await axios.get(`http://localhost:${PORT}/api/health`, { timeout: 5000 });
+  } catch (e) {
+    // тихо
+  }
+}, 300000); // каждые 5 минут
+
 initDatabase().then(() => {
   app.listen(PORT, () => {
     console.log(`🚀 Сервер на порту ${PORT}`);
     console.log(`📊 БД: ${pool ? 'подключена' : 'DEMO режим'}`);
-    console.log(`🔐 Логин работает с email и паролем из БД`);
+    console.log(`🎁 Бесплатных генераций: 5`);
+    console.log(`📝 Длина пункта: 45-60 слов`);
+    console.log(`⚡ Кэш включён, пинг включён`);
   });
 });
