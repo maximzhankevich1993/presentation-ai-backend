@@ -52,14 +52,14 @@ setInterval(() => {
 
 // ═══════════════════════════════════════════════════════════════
 // YANDEX GPT
-// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
 const YANDEX_API_KEY = process.env.YANDEX_API_KEY;
 const YANDEX_FOLDER_ID = process.env.YANDEX_FOLDER_ID;
 const YANDEX_URL = 'https://llm.api.cloud.yandex.net/foundationModels/v1/completion';
 
 // ═══════════════════════════════════════════════════════════════
 // EMAIL
-// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
 const transporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST || 'smtp.sendgrid.net',
   port: parseInt(process.env.SMTP_PORT || '587'),
@@ -83,7 +83,6 @@ async function optionalAuth(req, res, next) {
   const token = req.headers.authorization?.replace('Bearer ', '');
   
   if (!token || !pool) {
-    // Для гостей используем IP как идентификатор
     const guestId = req.headers['x-forwarded-for'] || req.ip || req.connection?.remoteAddress || 'unknown';
     const usedGenerations = guestGenerationCounter.get(guestId) || 0;
     
@@ -295,7 +294,6 @@ app.post('/api/auth/register', async (req, res) => {
       }
     }
 
-    // Отправка письма в фоне (не блокируем ответ)
     setTimeout(() => {
       transporter.sendMail({
         from: `"Презентатор ИИ" <${FROM_EMAIL}>`,
@@ -438,7 +436,7 @@ app.post('/api/auth/logout', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// GENERATE (ПРЕЗЕНТАЦИИ) - С ЛИМИТОМ 5 ГЕНЕРАЦИЙ
+// GENERATE (ПРЕЗЕНТАЦИИ)
 // ═══════════════════════════════════════════════════════════════
 app.post('/api/generate', optionalAuth, async (req, res) => {
   try {
@@ -450,7 +448,6 @@ app.post('/api/generate', optionalAuth, async (req, res) => {
     const user = req.user;
     console.log(`🎯 Генерация: "${topic}" (${slidesCount} слайдов) - ${user.email}, осталось: ${user.free_generations_left}`);
 
-    // ПРОВЕРКА ЛИМИТА (5 генераций)
     if (user.free_generations_left <= 0) {
       return res.status(402).json({ 
         error: 'Бесплатные генерации закончились',
@@ -461,23 +458,19 @@ app.post('/api/generate', optionalAuth, async (req, res) => {
 
     const cacheKey = `${topic.toLowerCase()}_${slidesCount}`;
     
-    // Проверка кэша
     if (generationCache.has(cacheKey)) {
       const cached = generationCache.get(cacheKey);
       console.log(`📦 Кэш: "${topic}" - ${user.email}`);
       
-      // Уменьшаем счётчик при использовании кэша
       if (user.id === 'guest') {
         const newCount = (user.generations_used || 0) + 1;
         guestGenerationCounter.set(user.guestId, newCount);
-        console.log(`👤 Гость использовал ${newCount}/5 генераций (кэш)`);
       } else if (pool && user.id !== 'guest') {
         const newLeft = Math.max(0, (user.free_generations_left || 0) - 1);
         await pool.query(
           'UPDATE users SET free_generations_left = $1, total_generations = total_generations + 1 WHERE id = $2',
           [newLeft, user.id]
         );
-        console.log(`👤 ${user.email} использовал генерацию, осталось: ${newLeft}`);
       }
       
       return res.json(cached);
@@ -490,7 +483,7 @@ app.post('/api/generate', optionalAuth, async (req, res) => {
 
 ПРАВИЛА:
 - Каждый слайд: ЗАГОЛОВОК (5-8 слов) + 4-6 пунктов
-- Длина КАЖДОГО пункта: ${minWords}-${maxWords} слов (ОБЯЗАТЕЛЬНО 45-60 слов!)
+- Длина КАЖДОГО пункта: ${minWords}-${maxWords} слов
 - Используй: цифры, проценты, даты, статистику, примеры из реальной жизни
 
 Верни ТОЛЬКО JSON в формате:
@@ -537,25 +530,20 @@ app.post('/api/generate', optionalAuth, async (req, res) => {
       });
     }
     
-    // Сохраняем в кэш
     generationCache.set(cacheKey, presentation);
     setTimeout(() => generationCache.delete(cacheKey), CACHE_TTL);
 
-    // УМЕНЬШАЕМ СЧЁТЧИК ПОСЛЕ УСПЕШНОЙ ГЕНЕРАЦИИ
     if (user.id === 'guest') {
       const newCount = (user.generations_used || 0) + 1;
       guestGenerationCounter.set(user.guestId, newCount);
-      console.log(`👤 Гость использовал ${newCount}/5 генераций`);
     } else if (pool && user.id !== 'guest') {
       const newLeft = Math.max(0, (user.free_generations_left || 0) - 1);
       await pool.query(
         'UPDATE users SET free_generations_left = $1, total_generations = total_generations + 1 WHERE id = $2',
         [newLeft, user.id]
       );
-      console.log(`👤 ${user.email} использовал генерацию, осталось: ${newLeft}`);
     }
     
-    // Сохраняем в историю
     if (pool && user.id !== 'guest') {
       await pool.query(
         `INSERT INTO generation_history (user_id, type, title, slide_count, created_at)
@@ -588,20 +576,21 @@ app.post('/api/generate', optionalAuth, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// LESSON PLAN GENERATE - С ЛИМИТОМ
+// LESSON PLAN GENERATE - НОВЫЙ ПРОМПТ (ПОЛНОЦЕННЫЙ УРОК)
 // ═══════════════════════════════════════════════════════════════
 app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
   try {
-    const { topic, subject, standard, grade, durationMinutes = 45 } = req.body;
+    const { topic, subject, standard, grade, durationMinutes = 45, slideCount = 5 } = req.body;
     
     if (!topic || !subject || !grade) {
       return res.status(400).json({ error: 'Тема, предмет и класс обязательны' });
     }
 
     const user = req.user;
-    console.log(`📚 Генерация плана урока: "${topic}" - ${user.email}, осталось: ${user.free_generations_left}`);
+    const slidesCount = Math.min(Math.max(slideCount, 3), 10);
+    
+    console.log(`📚 Генерация урока: "${topic}" (${slidesCount} слайдов, ${subject}) - ${user.email}, осталось: ${user.free_generations_left}`);
 
-    // ПРОВЕРКА ЛИМИТА
     if (user.free_generations_left <= 0) {
       return res.status(402).json({ 
         error: 'Бесплатные генерации закончились',
@@ -610,7 +599,80 @@ app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
       });
     }
 
-    // УМЕНЬШАЕМ СЧЁТЧИК
+    const prompt = `Ты — опытный учитель по предмету "${subject}" для ${grade} класса. Создай полноценный урок на тему "${topic}" в виде презентации на ${slidesCount} слайдов.
+
+ТРЕБОВАНИЯ:
+- Каждый слайд — это отдельная часть урока
+- Содержание должно быть информативным, понятным для учеников ${grade} класса
+- Используй: определения, примеры, факты, вопросы для учеников
+- Добавляй конкретные знания по теме "${topic}" и предмету "${subject}"
+
+ПРИМЕР СТРУКТУРЫ УРОКА (тема: "Тектонические плиты", предмет: "География"):
+1. Что такое тектонические плиты? (определение + примеры крупнейших плит)
+2. История открытия (ключевые учёные: Альфред Вегенер, даты, факты)
+3. Типы тектонических плит (океанические, континентальные, их особенности)
+4. Движение плит (скорость, направления, причины движения)
+5. Границы плит (дивергентные, конвергентные, трансформные)
+6. Результаты движения (землетрясения, вулканы, горообразование)
+7. Примеры: Тихоокеанское огненное кольцо
+8. Практическое задание для учеников (работа с картой)
+9. Контрольные вопросы для проверки понимания
+10. Итоги урока и выводы
+
+Верни ТОЛЬКО JSON в формате:
+{
+  "topic": "${topic}",
+  "subject": "${subject}",
+  "grade": "${grade}",
+  "slides": [
+    {
+      "title": "Заголовок слайда (5-10 слов)",
+      "content": [
+        "Ключевой факт или определение (20-35 слов)",
+        "Дополнительная информация с примером (20-35 слов)",
+        "Вопрос к ученикам или задание (15-25 слов)",
+        "Вывод или запоминающийся факт (15-25 слов)"
+      ]
+    }
+  ],
+  "homework": "Домашнее задание (30-60 слов с конкретными заданиями)",
+  "materials": ["Материал или ресурс 1", "Материал или ресурс 2", "Материал или ресурс 3"]
+}`;
+
+    const response = await axios.post(YANDEX_URL, {
+      modelUri: `gpt://${YANDEX_FOLDER_ID}/yandexgpt/latest`,
+      completionOptions: { stream: false, temperature: 0.7, maxTokens: "8000" },
+      messages: [{ role: 'user', text: prompt }]
+    }, { 
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Api-Key ${YANDEX_API_KEY}` }, 
+      timeout: 90000 
+    });
+
+    let text = response.data.result.alternatives[0].message.text;
+    let cleanText = text.replace(/```json\n?/g, '').replace(/```/g, '').trim();
+    
+    const jsonMatch = cleanText.match(/\{[\s\S]*\}/);
+    if (jsonMatch) cleanText = jsonMatch[0];
+    
+    let lessonData = JSON.parse(cleanText);
+    
+    if (!lessonData.slides || lessonData.slides.length === 0) {
+      lessonData.slides = [];
+    }
+    
+    while (lessonData.slides.length < slidesCount) {
+      lessonData.slides.push({
+        title: `${lessonData.slides.length + 1}. Вопрос по теме "${topic}"`,
+        content: [
+          `Ключевой аспект темы "${topic}" требует внимательного изучения.`,
+          `Статистика показывает важность этого вопроса в ${subject}.`,
+          `Как вы думаете, почему это важно для понимания темы?`,
+          `Рекомендуется запомнить этот материал для дальнейшего изучения.`
+        ]
+      });
+    }
+
+    // Уменьшаем счётчик
     if (user.id === 'guest') {
       const newCount = (user.generations_used || 0) + 1;
       guestGenerationCounter.set(user.guestId, newCount);
@@ -621,30 +683,12 @@ app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
         [newLeft, user.id]
       );
     }
-
-    res.json({
-      topic: topic,
-      subject: subject,
-      grade: grade,
-      standard: standard || 'common_core',
-      duration: `${durationMinutes} минут`,
-      objectives: [
-        `Понять основные концепции темы "${topic}" и уметь их объяснять.`,
-        `Научиться применять полученные знания на практике.`,
-        `Развить навыки анализа и синтеза информации.`,
-        `Сформировать умение работать в группе и презентовать результаты.`
-      ],
-      stages: getDefaultStages(topic, durationMinutes),
-      homework: `Повторить тему "${topic}". Подготовить краткое сообщение.`,
-      assessment: 'Фронтальный опрос, практическая работа, самооценка.',
-      differentiation: [
-        'Задания разного уровня сложности.',
-        'Индивидуальные карточки-помощники.',
-        'Дополнительные задания для мотивированных учеников.',
-        'Работа в парах и малых группах.'
-      ]
-    });
+    
+    console.log(`✅ Урок создан: "${topic}" (${lessonData.slides.length} слайдов)`);
+    res.json(lessonData);
+    
   } catch (e) {
+    console.error('❌ Lesson Plan error:', e.message);
     res.status(500).json({ error: 'Ошибка генерации плана урока' });
   }
 });
@@ -663,7 +707,6 @@ app.post('/api/quiz/generate', optionalAuth, async (req, res) => {
     
     console.log(`📝 Генерация теста: "${topic}" - ${user.email}, осталось: ${user.free_generations_left}`);
 
-    // ПРОВЕРКА ЛИМИТА
     if (user.free_generations_left <= 0) {
       return res.status(402).json({ 
         error: 'Бесплатные генерации закончились',
@@ -672,7 +715,6 @@ app.post('/api/quiz/generate', optionalAuth, async (req, res) => {
       });
     }
 
-    // УМЕНЬШАЕМ СЧЁТЧИК
     if (user.id === 'guest') {
       const newCount = (user.generations_used || 0) + 1;
       guestGenerationCounter.set(user.guestId, newCount);
@@ -713,7 +755,6 @@ app.post('/api/quiz/from-presentation', optionalAuth, async (req, res) => {
     
     console.log(`📝 Генерация теста из презентации: "${title}" - ${user.email}, осталось: ${user.free_generations_left}`);
 
-    // ПРОВЕРКА ЛИМИТА
     if (user.free_generations_left <= 0) {
       return res.status(402).json({ 
         error: 'Бесплатные генерации закончились',
@@ -722,7 +763,6 @@ app.post('/api/quiz/from-presentation', optionalAuth, async (req, res) => {
       });
     }
 
-    // УМЕНЬШАЕМ СЧЁТЧИК
     if (user.id === 'guest') {
       const newCount = (user.generations_used || 0) + 1;
       guestGenerationCounter.set(user.guestId, newCount);
@@ -764,7 +804,6 @@ app.post('/api/report/generate', optionalAuth, async (req, res) => {
     const user = req.user;
     console.log(`📊 Генерация отчёта: "${company}" - ${user.email}, осталось: ${user.free_generations_left}`);
 
-    // ПРОВЕРКА ЛИМИТА
     if (user.free_generations_left <= 0) {
       return res.status(402).json({ 
         error: 'Бесплатные генерации закончились',
@@ -773,7 +812,6 @@ app.post('/api/report/generate', optionalAuth, async (req, res) => {
       });
     }
 
-    // УМЕНЬШАЕМ СЧЁТЧИК
     if (user.id === 'guest') {
       const newCount = (user.generations_used || 0) + 1;
       guestGenerationCounter.set(user.guestId, newCount);
@@ -970,6 +1008,7 @@ initDatabase().then(() => {
     console.log(`🚀 Сервер на порту ${PORT}`);
     console.log(`📊 БД: ${pool ? 'подключена' : 'DEMO режим'}`);
     console.log(`🎁 Бесплатных генераций: 5 для всех пользователей`);
+    console.log(`📚 Конструктор уроков: полноценные уроки, до 10 слайдов`);
     console.log(`⚡ Кэш включён, пинг включён`);
   });
 });
