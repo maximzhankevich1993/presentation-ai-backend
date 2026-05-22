@@ -77,8 +77,75 @@ if (!YANDEX_API_KEY || !YANDEX_FOLDER_ID) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// MIDDLEWARE
+// ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 // ═══════════════════════════════════════════════════════════════
+
+// Проверка и сброс ежемесячных генераций
+async function checkAndResetMonthlyGenerations(user) {
+  if (!pool || user.id === 'guest') return user;
+  
+  try {
+    const now = new Date();
+    const lastReset = user.last_reset_date ? new Date(user.last_reset_date) : null;
+    
+    // Проверяем, нужно ли сбросить (новый месяц)
+    const needReset = !lastReset || 
+      now.getMonth() !== lastReset.getMonth() || 
+      now.getFullYear() !== lastReset.getFullYear();
+    
+    if (needReset && !user.is_premium && !user.is_vip) {
+      const newMonthlyLeft = 5;
+      await pool.query(
+        `UPDATE users 
+         SET monthly_generations_left = $1, 
+             last_reset_date = NOW(),
+             free_generations_left = $1
+         WHERE id = $2`,
+        [newMonthlyLeft, user.id]
+      );
+      
+      user.monthly_generations_left = newMonthlyLeft;
+      user.free_generations_left = newMonthlyLeft;
+      user.last_reset_date = now;
+      console.log(`🔄 Сброс ежемесячных генераций для ${user.email} до ${newMonthlyLeft}`);
+    }
+  } catch (e) {
+    console.error('Ошибка сброса месячного лимита:', e);
+  }
+  
+  return user;
+}
+
+// Уменьшение счётчика генераций
+async function decrementGenerations(user) {
+  if (user.id === 'guest') {
+    const newCount = (user.generations_used || 0) + 1;
+    guestGenerationCounter.set(user.guestId, newCount);
+    user.free_generations_left = Math.max(0, 5 - newCount);
+    user.generations_used = newCount;
+    return user;
+  }
+  
+  if (!pool) return user;
+  
+  const newLeft = Math.max(0, (user.free_generations_left || 0) - 1);
+  const newMonthlyLeft = Math.max(0, (user.monthly_generations_left || 0) - 1);
+  
+  await pool.query(
+    `UPDATE users 
+     SET free_generations_left = $1, 
+         monthly_generations_left = $2, 
+         total_generations = total_generations + 1 
+     WHERE id = $3`,
+    [newLeft, newMonthlyLeft, user.id]
+  );
+  
+  user.free_generations_left = newLeft;
+  user.monthly_generations_left = newMonthlyLeft;
+  
+  return user;
+}
+
 async function optionalAuth(req, res, next) {
   const token = req.headers.authorization?.replace('Bearer ', '');
   
@@ -92,9 +159,11 @@ async function optionalAuth(req, res, next) {
       name: 'Гость', 
       is_premium: false, 
       free_generations_left: Math.max(0, 5 - usedGenerations),
+      monthly_generations_left: Math.max(0, 5 - usedGenerations),
       generations_used: usedGenerations,
       is_vip: false,
-      guestId: guestId
+      guestId: guestId,
+      last_reset_date: null
     };
     return next();
   }
@@ -102,7 +171,8 @@ async function optionalAuth(req, res, next) {
   try {
     const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
     const result = await pool.query(
-      `SELECT u.id, u.email, u.name, u.is_premium, u.premium_expiry, u.free_generations_left, u.is_vip
+      `SELECT u.id, u.email, u.name, u.is_premium, u.premium_expiry, 
+              u.free_generations_left, u.monthly_generations_left, u.last_reset_date, u.is_vip
        FROM sessions s JOIN users u ON u.id = s.user_id
        WHERE s.token_hash = $1 AND s.expires_at > NOW()`,
       [tokenHash]
@@ -110,6 +180,8 @@ async function optionalAuth(req, res, next) {
 
     if (result.rows.length > 0) {
       req.user = result.rows[0];
+      // Проверяем и сбрасываем ежемесячный лимит
+      req.user = await checkAndResetMonthlyGenerations(req.user);
     } else {
       const guestId = req.headers['x-forwarded-for'] || req.ip || req.connection?.remoteAddress || 'unknown';
       const usedGenerations = guestGenerationCounter.get(guestId) || 0;
@@ -119,9 +191,11 @@ async function optionalAuth(req, res, next) {
         name: 'Гость', 
         is_premium: false, 
         free_generations_left: Math.max(0, 5 - usedGenerations),
+        monthly_generations_left: Math.max(0, 5 - usedGenerations),
         generations_used: usedGenerations,
         is_vip: false,
-        guestId: guestId
+        guestId: guestId,
+        last_reset_date: null
       };
     }
     next();
@@ -134,9 +208,11 @@ async function optionalAuth(req, res, next) {
       name: 'Гость', 
       is_premium: false, 
       free_generations_left: Math.max(0, 5 - usedGenerations),
+      monthly_generations_left: Math.max(0, 5 - usedGenerations),
       generations_used: usedGenerations,
       is_vip: false,
-      guestId: guestId
+      guestId: guestId,
+      last_reset_date: null
     };
     next();
   }
@@ -228,7 +304,7 @@ app.get('/api/health', (req, res) => {
 
 app.post('/api/auth/register', async (req, res) => {
   if (!pool) {
-    return res.json({ token: 'demo-token', user: { id: 'demo', email: req.body.email, name: req.body.name || 'Demo', isPremium: false, freeGenerationsLeft: 5 } });
+    return res.json({ token: 'demo-token', user: { id: 'demo', email: req.body.email, name: req.body.name || 'Demo', isPremium: false, freeGenerationsLeft: 5, monthlyGenerationsLeft: 5 } });
   }
 
   try {
@@ -243,8 +319,8 @@ app.post('/api/auth/register', async (req, res) => {
     const verificationToken = crypto.randomBytes(32).toString('hex');
 
     const result = await pool.query(
-      `INSERT INTO users (email, password_hash, name, verification_token, free_generations_left)
-       VALUES ($1, $2, $3, $4, 5) RETURNING id, email, name`,
+      `INSERT INTO users (email, password_hash, name, verification_token, free_generations_left, monthly_generations_left, last_reset_date)
+       VALUES ($1, $2, $3, $4, 5, 5, NOW()) RETURNING id, email, name`,
       [email.toLowerCase(), passwordHash, name || email.split('@')[0], verificationToken]
     );
 
@@ -283,7 +359,8 @@ app.post('/api/auth/register', async (req, res) => {
             
             await pool.query(
               `UPDATE users 
-               SET free_generations_left = free_generations_left + 2
+               SET free_generations_left = free_generations_left + 2,
+                   monthly_generations_left = monthly_generations_left + 2
                WHERE id = $1`,
               [referrerId]
             );
@@ -299,11 +376,11 @@ app.post('/api/auth/register', async (req, res) => {
         from: `"Презентатор ИИ" <${FROM_EMAIL}>`,
         to: email,
         subject: 'Добро пожаловать! 🎉',
-        html: `<h2>Добро пожаловать, ${user.name}!</h2><p>🎁 5 бесплатных генераций уже ждут вас.</p>`
+        html: `<h2>Добро пожаловать, ${user.name}!</h2><p>🎁 5 бесплатных генераций каждый месяц.</p>`
       }).catch(console.log);
     }, 0);
 
-    res.json({ token: sessionToken, user: { id: user.id, email: user.email, name: user.name, isPremium: false, freeGenerationsLeft: 5 } });
+    res.json({ token: sessionToken, user: { id: user.id, email: user.email, name: user.name, isPremium: false, freeGenerationsLeft: 5, monthlyGenerationsLeft: 5 } });
   } catch (e) {
     console.error('Register:', e);
     res.status(500).json({ error: 'Ошибка регистрации' });
@@ -312,7 +389,7 @@ app.post('/api/auth/register', async (req, res) => {
 
 app.post('/api/auth/login', async (req, res) => {
   if (!pool) {
-    return res.json({ token: 'demo-token', user: { id: 'demo', email: req.body.email, name: 'Demo', isPremium: true, freeGenerationsLeft: 999, isVip: true } });
+    return res.json({ token: 'demo-token', user: { id: 'demo', email: req.body.email, name: 'Demo', isPremium: true, freeGenerationsLeft: 999, monthlyGenerationsLeft: 999, isVip: true } });
   }
 
   try {
@@ -324,7 +401,10 @@ app.post('/api/auth/login', async (req, res) => {
     }
 
     const result = await pool.query(
-      'SELECT id, email, name, password_hash, is_premium, premium_expiry, free_generations_left, failed_login_attempts, locked_until, is_vip FROM users WHERE email = $1',
+      `SELECT id, email, name, password_hash, is_premium, premium_expiry, 
+              free_generations_left, monthly_generations_left, last_reset_date, 
+              failed_login_attempts, locked_until, is_vip 
+       FROM users WHERE email = $1`,
       [email.toLowerCase()]
     );
 
@@ -333,7 +413,7 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Неверный email или пароль' });
     }
 
-    const user = result.rows[0];
+    let user = result.rows[0];
     console.log('✅ Пользователь найден:', user.email);
 
     if (user.locked_until && new Date(user.locked_until) > new Date()) {
@@ -351,6 +431,9 @@ app.post('/api/auth/login', async (req, res) => {
     }
 
     console.log('✅ Пароль верный');
+
+    // Проверяем и сбрасываем ежемесячный лимит
+    user = await checkAndResetMonthlyGenerations(user);
 
     await pool.query(
       'UPDATE users SET failed_login_attempts = 0, locked_until = NULL, last_login = NOW() WHERE id = $1',
@@ -379,6 +462,7 @@ app.post('/api/auth/login', async (req, res) => {
         isPremium: user.is_premium || false, 
         premiumExpiry: user.premium_expiry, 
         freeGenerationsLeft: user.free_generations_left || 5,
+        monthlyGenerationsLeft: user.monthly_generations_left || 5,
         isVip: user.is_vip || false
       }
     });
@@ -445,14 +529,24 @@ app.post('/api/generate', optionalAuth, async (req, res) => {
     
     if (!topic) return res.status(400).json({ error: 'Тема не указана' });
 
-    const user = req.user;
+    let user = req.user;
     console.log(`🎯 Генерация: "${topic}" (${slidesCount} слайдов) - ${user.email}, осталось: ${user.free_generations_left}`);
 
+    // Проверка лимита генераций
     if (user.free_generations_left <= 0) {
       return res.status(402).json({ 
         error: 'Бесплатные генерации закончились',
         needPayment: true,
-        message: 'У вас закончились бесплатные генерации. Оформите подписку, чтобы продолжить.'
+        message: 'У вас закончились бесплатные генерации на этот месяц. Оформите подписку, чтобы продолжить.'
+      });
+    }
+
+    // Проверка лимита слайдов для бесплатных пользователей
+    if (!user.is_premium && !user.is_vip && slidesCount > 10) {
+      return res.status(402).json({ 
+        error: 'Бесплатные презентации ограничены 10 слайдами',
+        needPayment: true,
+        message: 'В бесплатной версии максимум 10 слайдов. Оформите подписку для создания более объёмных презентаций.'
       });
     }
 
@@ -462,17 +556,7 @@ app.post('/api/generate', optionalAuth, async (req, res) => {
       const cached = generationCache.get(cacheKey);
       console.log(`📦 Кэш: "${topic}" - ${user.email}`);
       
-      if (user.id === 'guest') {
-        const newCount = (user.generations_used || 0) + 1;
-        guestGenerationCounter.set(user.guestId, newCount);
-      } else if (pool && user.id !== 'guest') {
-        const newLeft = Math.max(0, (user.free_generations_left || 0) - 1);
-        await pool.query(
-          'UPDATE users SET free_generations_left = $1, total_generations = total_generations + 1 WHERE id = $2',
-          [newLeft, user.id]
-        );
-      }
-      
+      user = await decrementGenerations(user);
       return res.json(cached);
     }
 
@@ -533,16 +617,7 @@ app.post('/api/generate', optionalAuth, async (req, res) => {
     generationCache.set(cacheKey, presentation);
     setTimeout(() => generationCache.delete(cacheKey), CACHE_TTL);
 
-    if (user.id === 'guest') {
-      const newCount = (user.generations_used || 0) + 1;
-      guestGenerationCounter.set(user.guestId, newCount);
-    } else if (pool && user.id !== 'guest') {
-      const newLeft = Math.max(0, (user.free_generations_left || 0) - 1);
-      await pool.query(
-        'UPDATE users SET free_generations_left = $1, total_generations = total_generations + 1 WHERE id = $2',
-        [newLeft, user.id]
-      );
-    }
+    user = await decrementGenerations(user);
     
     if (pool && user.id !== 'guest') {
       await pool.query(
@@ -576,7 +651,7 @@ app.post('/api/generate', optionalAuth, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// LESSON PLAN GENERATE - НОВЫЙ ПРОМПТ (ПОЛНОЦЕННЫЙ УРОК)
+// LESSON PLAN GENERATE
 // ═══════════════════════════════════════════════════════════════
 app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
   try {
@@ -586,8 +661,17 @@ app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
       return res.status(400).json({ error: 'Тема, предмет и класс обязательны' });
     }
 
-    const user = req.user;
-    const slidesCount = Math.min(Math.max(slideCount, 3), 10);
+    let user = req.user;
+    let slidesCount = Math.min(Math.max(slideCount, 3), 10);
+    
+    // Проверка лимита слайдов для бесплатных пользователей
+    if (!user.is_premium && !user.is_vip && slidesCount > 10) {
+      return res.status(402).json({ 
+        error: 'Бесплатные уроки ограничены 10 слайдами',
+        needPayment: true,
+        message: 'В бесплатной версии максимум 10 слайдов. Оформите подписку для создания более подробных уроков.'
+      });
+    }
     
     console.log(`📚 Генерация урока: "${topic}" (${slidesCount} слайдов, ${subject}) - ${user.email}, осталось: ${user.free_generations_left}`);
 
@@ -595,7 +679,7 @@ app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
       return res.status(402).json({ 
         error: 'Бесплатные генерации закончились',
         needPayment: true,
-        message: 'У вас закончились бесплатные генерации. Оформите подписку, чтобы продолжить.'
+        message: 'У вас закончились бесплатные генерации на этот месяц. Оформите подписку, чтобы продолжить.'
       });
     }
 
@@ -606,18 +690,6 @@ app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
 - Содержание должно быть информативным, понятным для учеников ${grade} класса
 - Используй: определения, примеры, факты, вопросы для учеников
 - Добавляй конкретные знания по теме "${topic}" и предмету "${subject}"
-
-ПРИМЕР СТРУКТУРЫ УРОКА (тема: "Тектонические плиты", предмет: "География"):
-1. Что такое тектонические плиты? (определение + примеры крупнейших плит)
-2. История открытия (ключевые учёные: Альфред Вегенер, даты, факты)
-3. Типы тектонических плит (океанические, континентальные, их особенности)
-4. Движение плит (скорость, направления, причины движения)
-5. Границы плит (дивергентные, конвергентные, трансформные)
-6. Результаты движения (землетрясения, вулканы, горообразование)
-7. Примеры: Тихоокеанское огненное кольцо
-8. Практическое задание для учеников (работа с картой)
-9. Контрольные вопросы для проверки понимания
-10. Итоги урока и выводы
 
 Верни ТОЛЬКО JSON в формате:
 {
@@ -672,16 +744,7 @@ app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
       });
     }
 
-    if (user.id === 'guest') {
-      const newCount = (user.generations_used || 0) + 1;
-      guestGenerationCounter.set(user.guestId, newCount);
-    } else if (pool && user.id !== 'guest') {
-      const newLeft = Math.max(0, (user.free_generations_left || 0) - 1);
-      await pool.query(
-        'UPDATE users SET free_generations_left = $1, total_generations = total_generations + 1 WHERE id = $2',
-        [newLeft, user.id]
-      );
-    }
+    user = await decrementGenerations(user);
     
     console.log(`✅ Урок создан: "${topic}" (${lessonData.slides.length} слайдов)`);
     res.json(lessonData);
@@ -694,14 +757,14 @@ app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
 
 // ═══════════════════════════════════════════════════════════════
 // QUIZ GENERATE
-// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
 app.post('/api/quiz/generate', optionalAuth, async (req, res) => {
   try {
     const { topic, questionCount = 5 } = req.body;
     
     if (!topic) return res.status(400).json({ error: 'Тема не указана' });
     
-    const user = req.user;
+    let user = req.user;
     const qCount = Math.min(Math.max(questionCount, 3), 10);
     
     console.log(`📝 Генерация теста: "${topic}" - ${user.email}, осталось: ${user.free_generations_left}`);
@@ -710,19 +773,8 @@ app.post('/api/quiz/generate', optionalAuth, async (req, res) => {
       return res.status(402).json({ 
         error: 'Бесплатные генерации закончились',
         needPayment: true,
-        message: 'У вас закончились бесплатные генерации. Оформите подписку, чтобы продолжить.'
+        message: 'У вас закончились бесплатные генерации на этот месяц. Оформите подписку, чтобы продолжить.'
       });
-    }
-
-    if (user.id === 'guest') {
-      const newCount = (user.generations_used || 0) + 1;
-      guestGenerationCounter.set(user.guestId, newCount);
-    } else if (pool && user.id !== 'guest') {
-      const newLeft = Math.max(0, (user.free_generations_left || 0) - 1);
-      await pool.query(
-        'UPDATE users SET free_generations_left = $1, total_generations = total_generations + 1 WHERE id = $2',
-        [newLeft, user.id]
-      );
     }
 
     const questions = [];
@@ -734,6 +786,8 @@ app.post('/api/quiz/generate', optionalAuth, async (req, res) => {
         explanation: `Пояснение к вопросу ${i + 1}.`
       });
     }
+    
+    user = await decrementGenerations(user);
     
     res.json({ questions: questions, difficulty: 'medium', timeLimitMinutes: qCount * 2 });
   } catch (e) {
@@ -749,7 +803,7 @@ app.post('/api/quiz/from-presentation', optionalAuth, async (req, res) => {
       return res.status(400).json({ error: 'Некорректные данные' });
     }
     
-    const user = req.user;
+    let user = req.user;
     const qCount = Math.min(Math.max(questionCount, 3), 10);
     
     console.log(`📝 Генерация теста из презентации: "${title}" - ${user.email}, осталось: ${user.free_generations_left}`);
@@ -758,19 +812,8 @@ app.post('/api/quiz/from-presentation', optionalAuth, async (req, res) => {
       return res.status(402).json({ 
         error: 'Бесплатные генерации закончились',
         needPayment: true,
-        message: 'У вас закончились бесплатные генерации. Оформите подписку, чтобы продолжить.'
+        message: 'У вас закончились бесплатные генерации на этот месяц. Оформите подписку, чтобы продолжить.'
       });
-    }
-
-    if (user.id === 'guest') {
-      const newCount = (user.generations_used || 0) + 1;
-      guestGenerationCounter.set(user.guestId, newCount);
-    } else if (pool && user.id !== 'guest') {
-      const newLeft = Math.max(0, (user.free_generations_left || 0) - 1);
-      await pool.query(
-        'UPDATE users SET free_generations_left = $1, total_generations = total_generations + 1 WHERE id = $2',
-        [newLeft, user.id]
-      );
     }
 
     const questions = [];
@@ -783,6 +826,8 @@ app.post('/api/quiz/from-presentation', optionalAuth, async (req, res) => {
       });
     }
     
+    user = await decrementGenerations(user);
+    
     res.json({ title: title, questions: questions, difficulty: 'medium', timeLimitMinutes: qCount * 2 });
   } catch (e) {
     res.status(500).json({ error: 'Ошибка генерации теста' });
@@ -790,7 +835,7 @@ app.post('/api/quiz/from-presentation', optionalAuth, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// REPORT GENERATE - НОВЫЙ ПРОМПТ (ПОЛНОЦЕННЫЙ ОТЧЁТ)
+// REPORT GENERATE
 // ═══════════════════════════════════════════════════════════════
 app.post('/api/report/generate', optionalAuth, async (req, res) => {
   try {
@@ -800,8 +845,13 @@ app.post('/api/report/generate', optionalAuth, async (req, res) => {
       return res.status(400).json({ error: 'Компания и период обязательны' });
     }
 
-    const user = req.user;
-    const slidesCount = Math.min(Math.max(slideCount, 3), 15);
+    let user = req.user;
+    let slidesCount = Math.min(Math.max(slideCount, 3), 15);
+    
+    // Проверка лимита слайдов для бесплатных пользователей
+    if (!user.is_premium && !user.is_vip && slidesCount > 10) {
+      slidesCount = 10;
+    }
     
     // Определяем тип отчёта
     let reportTypeName = 'Финансовый отчёт';
@@ -821,7 +871,7 @@ app.post('/api/report/generate', optionalAuth, async (req, res) => {
       return res.status(402).json({ 
         error: 'Бесплатные генерации закончились',
         needPayment: true,
-        message: 'У вас закончились бесплатные генерации. Оформите подписку, чтобы продолжить.'
+        message: 'У вас закончились бесплатные генерации на этот месяц. Оформите подписку, чтобы продолжить.'
       });
     }
 
@@ -883,6 +933,10 @@ ${structure}
 Верни ТОЛЬКО JSON в формате:
 {
   "title": "${reportTypeName}: ${company}",
+  "company": "${company}",
+  "period": "${period}",
+  "standard": "${standardName}",
+  "reportType": "${reportTypeName}",
   "slides": [
     {
       "title": "Заголовок слайда",
@@ -917,28 +971,33 @@ ${structure}
       reportData.slides = [];
     }
     
-    while (reportData.slides.length < slidesCount) {
-      reportData.slides.push({
-        title: `Раздел ${reportData.slides.length + 1}`,
-        content: [
-          `Дополнительный анализ по компании "${company}" за период ${period}.`,
-          `Показатели соответствуют стандартам ${standardName}.`,
-          `Требуется дополнительная проверка данных.`,
-          `Рекомендуется обновить информацию при наличии новых данных.`
-        ]
-      });
+    const targetCount = slidesCount;
+    if (reportData.slides.length < targetCount) {
+      for (let i = reportData.slides.length; i < targetCount; i++) {
+        if (i === 0) {
+          reportData.slides.push({
+            title: 'Титульный лист',
+            content: [company, `Отчёт за ${period}`, standardName]
+          });
+        } else if (i === 1) {
+          reportData.slides.push({
+            title: 'Ключевые показатели',
+            content: ['Выручка: ________ млн ₽', 'Прибыль: ________ млн ₽', 'Рентабельность: ________%']
+          });
+        } else {
+          reportData.slides.push({
+            title: `Раздел ${i + 1}`,
+            content: [
+              `Дополнительный анализ по компании "${company}".`,
+              `Показатели соответствуют стандартам ${standardName}.`,
+              `Рекомендуется обновить информацию при наличии новых данных.`
+            ]
+          });
+        }
+      }
     }
 
-    if (user.id === 'guest') {
-      const newCount = (user.generations_used || 0) + 1;
-      guestGenerationCounter.set(user.guestId, newCount);
-    } else if (pool && user.id !== 'guest') {
-      const newLeft = Math.max(0, (user.free_generations_left || 0) - 1);
-      await pool.query(
-        'UPDATE users SET free_generations_left = $1, total_generations = total_generations + 1 WHERE id = $2',
-        [newLeft, user.id]
-      );
-    }
+    user = await decrementGenerations(user);
     
     console.log(`✅ Отчёт создан: "${company}" (${reportData.slides.length} слайдов)`);
     res.json(reportData);
@@ -1062,6 +1121,8 @@ async function initDatabase() {
         is_premium BOOLEAN DEFAULT FALSE,
         premium_expiry TIMESTAMPTZ,
         free_generations_left INTEGER DEFAULT 5,
+        monthly_generations_left INTEGER DEFAULT 5,
+        last_reset_date TIMESTAMPTZ DEFAULT NOW(),
         total_generations INTEGER DEFAULT 0,
         surprise_uses_left INTEGER DEFAULT 3,
         email_verified BOOLEAN DEFAULT FALSE,
@@ -1119,9 +1180,9 @@ initDatabase().then(() => {
   app.listen(PORT, () => {
     console.log(`🚀 Сервер на порту ${PORT}`);
     console.log(`📊 БД: ${pool ? 'подключена' : 'DEMO режим'}`);
-    console.log(`🎁 Бесплатных генераций: 5 для всех пользователей`);
+    console.log(`🎁 Бесплатных генераций: 5 в месяц`);
     console.log(`📚 Конструктор уроков: полноценные уроки, до 10 слайдов`);
-    console.log(`📊 Конструктор отчётов: полноценные отчёты, до 15 слайдов`);
+    console.log(`📊 Конструктор отчётов: полноценные отчёты, до 15 слайдов (бесплатно до 10)`);
     console.log(`⚡ Кэш включён, пинг включён`);
   });
 });
