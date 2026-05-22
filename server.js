@@ -672,7 +672,6 @@ app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
       });
     }
 
-    // Уменьшаем счётчик
     if (user.id === 'guest') {
       const newCount = (user.generations_used || 0) + 1;
       guestGenerationCounter.set(user.guestId, newCount);
@@ -694,7 +693,7 @@ app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// QUIZ GENERATE - С ЛИМИТОМ
+// QUIZ GENERATE
 // ═══════════════════════════════════════════════════════════════
 app.post('/api/quiz/generate', optionalAuth, async (req, res) => {
   try {
@@ -791,24 +790,142 @@ app.post('/api/quiz/from-presentation', optionalAuth, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// REPORT GENERATE - С ЛИМИТОМ
+// REPORT GENERATE - НОВЫЙ ПРОМПТ (ПОЛНОЦЕННЫЙ ОТЧЁТ)
 // ═══════════════════════════════════════════════════════════════
 app.post('/api/report/generate', optionalAuth, async (req, res) => {
   try {
-    const { company, period, standard, reportType } = req.body;
+    const { company, period, standard, reportType, slideCount = 6 } = req.body;
     
     if (!company || !period) {
       return res.status(400).json({ error: 'Компания и период обязательны' });
     }
 
     const user = req.user;
-    console.log(`📊 Генерация отчёта: "${company}" - ${user.email}, осталось: ${user.free_generations_left}`);
+    const slidesCount = Math.min(Math.max(slideCount, 3), 15);
+    
+    // Определяем тип отчёта
+    let reportTypeName = 'Финансовый отчёт';
+    if (reportType === 'annual') reportTypeName = 'Годовой отчёт';
+    else if (reportType === 'esg') reportTypeName = 'ESG отчёт';
+    else if (reportType === 'management') reportTypeName = 'Управленческий отчёт';
+    
+    let standardName = standard.toUpperCase();
+    if (standard === 'ifrs') standardName = 'IFRS';
+    else if (standard === 'gaap') standardName = 'US GAAP';
+    else if (standard === 'rsbu') standardName = 'РСБУ';
+    else if (standard === 'gri') standardName = 'GRI';
+    
+    console.log(`📊 Генерация отчёта: "${company}" (${slidesCount} слайдов, ${reportTypeName}, ${standardName}) - ${user.email}, осталось: ${user.free_generations_left}`);
 
     if (user.free_generations_left <= 0) {
       return res.status(402).json({ 
         error: 'Бесплатные генерации закончились',
         needPayment: true,
         message: 'У вас закончились бесплатные генерации. Оформите подписку, чтобы продолжить.'
+      });
+    }
+
+    // Генерируем структуру в зависимости от количества слайдов
+    let structure = '';
+    if (reportType === 'esg') {
+      structure = `1. Титульный лист
+2. Обзор ESG-стратегии
+3. Экологические показатели (выбросы CO2, энергопотребление, отходы)
+4. Социальные показатели (сотрудники, безопасность, обучение)
+5. Управленческие показатели (комплаенс, антикоррупция)
+6. Достижения и сертификаты
+7. Цели на следующий период
+8. Выводы и рекомендации`;
+    } else if (slidesCount <= 5) {
+      structure = `1. Титульный лист
+2. Executive summary
+3. Ключевые финансовые показатели
+4. Анализ эффективности
+5. Выводы и рекомендации`;
+    } else if (slidesCount <= 8) {
+      structure = `1. Титульный лист
+2. Executive summary
+3. Ключевые финансовые показатели
+4. Анализ доходов и расходов
+5. Анализ ликвидности
+6. Анализ денежного потока
+7. Сравнение с предыдущим периодом
+8. Выводы и рекомендации`;
+    } else {
+      structure = `1. Титульный лист
+2. Executive summary
+3. Ключевые финансовые показатели (выручка, EBITDA, чистая прибыль)
+4. Анализ доходов по сегментам
+5. Анализ расходов по категориям
+6. Анализ рентабельности
+7. Анализ ликвидности (коэффициенты)
+8. Анализ долговой нагрузки
+9. Анализ денежного потока
+10. Сравнение с предыдущим периодом
+11. Сравнение с конкурентами
+12. Анализ рисков
+13. Прогноз на следующий период
+14. Рекомендации для руководства
+15. Приложения`;
+    }
+
+    const prompt = `Ты — профессиональный финансовый аналитик. Создай подробный ${reportTypeName} для компании "${company}" за период "${period}" по стандарту ${standardName}. Количество слайдов: ${slidesCount}.
+
+СТРУКТУРА ОТЧЁТА:
+${structure}
+
+ТРЕБОВАНИЯ:
+- Используй РЕАЛИСТИЧНЫЕ ЦИФРЫ (миллионы рублей, проценты, коэффициенты)
+- Данные должны выглядеть как настоящий отчёт
+- Добавляй аналитику, выводы и рекомендации
+- Для ESG отчёта добавь экологические и социальные показатели
+
+Верни ТОЛЬКО JSON в формате:
+{
+  "title": "${reportTypeName}: ${company}",
+  "slides": [
+    {
+      "title": "Заголовок слайда",
+      "content": [
+        "Пункт 1 с конкретными цифрами (20-40 слов)",
+        "Пункт 2 с аналитикой (20-40 слов)",
+        "Пункт 3 с выводом (15-25 слов)",
+        "Пункт 4 с рекомендацией (15-25 слов)"
+      ]
+    }
+  ]
+}`;
+
+    const response = await axios.post(YANDEX_URL, {
+      modelUri: `gpt://${YANDEX_FOLDER_ID}/yandexgpt/latest`,
+      completionOptions: { stream: false, temperature: 0.7, maxTokens: "8000" },
+      messages: [{ role: 'user', text: prompt }]
+    }, { 
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Api-Key ${YANDEX_API_KEY}` }, 
+      timeout: 90000 
+    });
+
+    let text = response.data.result.alternatives[0].message.text;
+    let cleanText = text.replace(/```json\n?/g, '').replace(/```/g, '').trim();
+    
+    const jsonMatch = cleanText.match(/\{[\s\S]*\}/);
+    if (jsonMatch) cleanText = jsonMatch[0];
+    
+    let reportData = JSON.parse(cleanText);
+    
+    if (!reportData.slides || reportData.slides.length === 0) {
+      reportData.slides = [];
+    }
+    
+    while (reportData.slides.length < slidesCount) {
+      reportData.slides.push({
+        title: `Раздел ${reportData.slides.length + 1}`,
+        content: [
+          `Дополнительный анализ по компании "${company}" за период ${period}.`,
+          `Показатели соответствуют стандартам ${standardName}.`,
+          `Требуется дополнительная проверка данных.`,
+          `Рекомендуется обновить информацию при наличии новых данных.`
+        ]
       });
     }
 
@@ -822,17 +939,12 @@ app.post('/api/report/generate', optionalAuth, async (req, res) => {
         [newLeft, user.id]
       );
     }
-
-    res.json({
-      title: `Отчёт: ${company}`,
-      slides: [
-        { title: 'Титульный лист', content: [company, `Отчёт за ${period}`, `Стандарт: ${standard || 'МСФО'}`] },
-        { title: 'Ключевые показатели', content: ['Выручка: 100 млн ₽', 'Прибыль: 25 млн ₽', 'Рентабельность: 25%'] },
-        { title: 'Анализ', content: ['Анализ деятельности компании показывает положительную динамику.'] },
-        { title: 'Выводы и рекомендации', content: ['Рекомендуется продолжить развитие в выбранном направлении.'] }
-      ]
-    });
+    
+    console.log(`✅ Отчёт создан: "${company}" (${reportData.slides.length} слайдов)`);
+    res.json(reportData);
+    
   } catch (e) {
+    console.error('❌ Report generation error:', e.message);
     res.status(500).json({ error: 'Ошибка генерации отчёта' });
   }
 });
@@ -1009,6 +1121,7 @@ initDatabase().then(() => {
     console.log(`📊 БД: ${pool ? 'подключена' : 'DEMO режим'}`);
     console.log(`🎁 Бесплатных генераций: 5 для всех пользователей`);
     console.log(`📚 Конструктор уроков: полноценные уроки, до 10 слайдов`);
+    console.log(`📊 Конструктор отчётов: полноценные отчёты, до 15 слайдов`);
     console.log(`⚡ Кэш включён, пинг включён`);
   });
 });
