@@ -88,7 +88,6 @@ async function checkAndResetMonthlyGenerations(user) {
     const now = new Date();
     const lastReset = user.last_reset_date ? new Date(user.last_reset_date) : null;
     
-    // Проверяем, нужно ли сбросить (новый месяц)
     const needReset = !lastReset || 
       now.getMonth() !== lastReset.getMonth() || 
       now.getFullYear() !== lastReset.getFullYear();
@@ -180,7 +179,6 @@ async function optionalAuth(req, res, next) {
 
     if (result.rows.length > 0) {
       req.user = result.rows[0];
-      // Проверяем и сбрасываем ежемесячный лимит
       req.user = await checkAndResetMonthlyGenerations(req.user);
     } else {
       const guestId = req.headers['x-forwarded-for'] || req.ip || req.connection?.remoteAddress || 'unknown';
@@ -432,7 +430,6 @@ app.post('/api/auth/login', async (req, res) => {
 
     console.log('✅ Пароль верный');
 
-    // Проверяем и сбрасываем ежемесячный лимит
     user = await checkAndResetMonthlyGenerations(user);
 
     await pool.query(
@@ -532,7 +529,6 @@ app.post('/api/generate', optionalAuth, async (req, res) => {
     let user = req.user;
     console.log(`🎯 Генерация: "${topic}" (${slidesCount} слайдов) - ${user.email}, осталось: ${user.free_generations_left}`);
 
-    // Проверка лимита генераций
     if (user.free_generations_left <= 0) {
       return res.status(402).json({ 
         error: 'Бесплатные генерации закончились',
@@ -541,7 +537,6 @@ app.post('/api/generate', optionalAuth, async (req, res) => {
       });
     }
 
-    // Проверка лимита слайдов для бесплатных пользователей
     if (!user.is_premium && !user.is_vip && slidesCount > 10) {
       return res.status(402).json({ 
         error: 'Бесплатные презентации ограничены 10 слайдами',
@@ -664,7 +659,6 @@ app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
     let user = req.user;
     let slidesCount = Math.min(Math.max(slideCount, 3), 10);
     
-    // Проверка лимита слайдов для бесплатных пользователей
     if (!user.is_premium && !user.is_vip && slidesCount > 10) {
       return res.status(402).json({ 
         error: 'Бесплатные уроки ограничены 10 слайдами',
@@ -757,7 +751,7 @@ app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
 
 // ═══════════════════════════════════════════════════════════════
 // QUIZ GENERATE
-// ═══════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════
 app.post('/api/quiz/generate', optionalAuth, async (req, res) => {
   try {
     const { topic, questionCount = 5 } = req.body;
@@ -777,20 +771,75 @@ app.post('/api/quiz/generate', optionalAuth, async (req, res) => {
       });
     }
 
-    const questions = [];
-    for (let i = 0; i < qCount; i++) {
-      questions.push({
-        question: `Вопрос ${i + 1} по теме "${topic}"?`,
-        options: ['Вариант А', 'Вариант Б', 'Вариант В', 'Вариант Г'],
-        correct: 0,
-        explanation: `Пояснение к вопросу ${i + 1}.`
+    const prompt = `Ты — опытный преподаватель. Создай тест из ${qCount} вопросов по теме "${topic}".
+
+ТРЕБОВАНИЯ:
+- Каждый вопрос должен быть конкретным и проверять знания по теме
+- 4 варианта ответа (А, Б, В, Г), только один правильный
+- Правильный ответ должен быть реалистичным
+- Добавь краткое пояснение к каждому вопросу
+
+Верни ТОЛЬКО JSON в формате:
+{
+  "questions": [
+    {
+      "question": "Конкретный вопрос по теме?",
+      "options": ["Правильный ответ", "Неверный вариант 1", "Неверный вариант 2", "Неверный вариант 3"],
+      "correct": 0,
+      "explanation": "Краткое пояснение правильного ответа"
+    }
+  ],
+  "difficulty": "medium",
+  "timeLimitMinutes": ${qCount * 2}
+}`;
+
+    try {
+      const response = await axios.post(YANDEX_URL, {
+        modelUri: `gpt://${YANDEX_FOLDER_ID}/yandexgpt/latest`,
+        completionOptions: { stream: false, temperature: 0.7, maxTokens: "4000" },
+        messages: [{ role: 'user', text: prompt }]
+      }, { 
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Api-Key ${YANDEX_API_KEY}` }, 
+        timeout: 60000 
       });
+
+      let text = response.data.result.alternatives[0].message.text;
+      let cleanText = text.replace(/```json\n?/g, '').replace(/```/g, '').trim();
+      
+      const jsonMatch = cleanText.match(/\{[\s\S]*\}/);
+      if (jsonMatch) cleanText = jsonMatch[0];
+      
+      let quizData = JSON.parse(cleanText);
+      
+      user = await decrementGenerations(user);
+      
+      console.log(`✅ Тест создан: "${topic}" (${quizData.questions?.length || 0} вопросов)`);
+      res.json(quizData);
+      
+    } catch (aiError) {
+      console.error('❌ YandexGPT error:', aiError.message);
+      
+      const questions = [];
+      for (let i = 0; i < qCount; i++) {
+        questions.push({
+          question: `Какое утверждение о теме "${topic}" является верным?`,
+          options: [
+            `${topic} — это важная область знаний`,
+            `${topic} не имеет практического применения`,
+            `${topic} изучается только в теории`,
+            `Все утверждения неверны`
+          ],
+          correct: 0,
+          explanation: `${topic} действительно является важной областью знаний с множеством практических применений.`
+        });
+      }
+      
+      user = await decrementGenerations(user);
+      res.json({ questions, difficulty: 'medium', timeLimitMinutes: qCount * 2 });
     }
     
-    user = await decrementGenerations(user);
-    
-    res.json({ questions: questions, difficulty: 'medium', timeLimitMinutes: qCount * 2 });
   } catch (e) {
+    console.error('❌ Quiz generation error:', e.message);
     res.status(500).json({ error: 'Ошибка генерации теста' });
   }
 });
@@ -806,30 +855,93 @@ app.post('/api/quiz/from-presentation', optionalAuth, async (req, res) => {
     let user = req.user;
     const qCount = Math.min(Math.max(questionCount, 3), 10);
     
-    console.log(`📝 Генерация теста из презентации: "${title}" - ${user.email}, осталось: ${user.free_generations_left}`);
+    console.log(`📝 Генерация теста из презентации: "${title}" - ${user.email}`);
 
     if (user.free_generations_left <= 0) {
       return res.status(402).json({ 
         error: 'Бесплатные генерации закончились',
         needPayment: true,
-        message: 'У вас закончились бесплатные генерации на этот месяц. Оформите подписку, чтобы продолжить.'
+        message: 'У вас закончились бесплатные генерации на этот месяц.'
       });
     }
 
-    const questions = [];
-    for (let i = 0; i < qCount; i++) {
-      questions.push({
-        question: `Вопрос по презентации "${title}"?`,
-        options: ['Вариант А', 'Вариант Б', 'Вариант В', 'Вариант Г'],
-        correct: 0,
-        explanation: `Пояснение на основе презентации.`
+    const slidesText = slides.map((s, i) => {
+      if (typeof s === 'string') return s;
+      if (s.content && Array.isArray(s.content)) return s.content.join(' ');
+      if (s.title) return s.title;
+      return '';
+    }).join('\n').substring(0, 3000);
+
+    const prompt = `На основе следующего содержания презентации "${title}" создай тест из ${qCount} вопросов:
+
+СОДЕРЖАНИЕ:
+${slidesText}
+
+ТРЕБОВАНИЯ:
+- Каждый вопрос должен проверять понимание материала из презентации
+- 4 варианта ответа, только один правильный
+- Добавь краткое пояснение
+
+Верни ТОЛЬКО JSON в формате:
+{
+  "title": "${title}",
+  "questions": [
+    {
+      "question": "Вопрос по содержанию презентации?",
+      "options": ["Правильный ответ", "Неверный 1", "Неверный 2", "Неверный 3"],
+      "correct": 0,
+      "explanation": "Пояснение"
+    }
+  ]
+}`;
+
+    try {
+      const response = await axios.post(YANDEX_URL, {
+        modelUri: `gpt://${YANDEX_FOLDER_ID}/yandexgpt/latest`,
+        completionOptions: { stream: false, temperature: 0.7, maxTokens: "4000" },
+        messages: [{ role: 'user', text: prompt }]
+      }, { 
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Api-Key ${YANDEX_API_KEY}` }, 
+        timeout: 60000 
       });
+
+      let text = response.data.result.alternatives[0].message.text;
+      let cleanText = text.replace(/```json\n?/g, '').replace(/```/g, '').trim();
+      
+      const jsonMatch = cleanText.match(/\{[\s\S]*\}/);
+      if (jsonMatch) cleanText = jsonMatch[0];
+      
+      let quizData = JSON.parse(cleanText);
+      
+      user = await decrementGenerations(user);
+      
+      console.log(`✅ Тест из презентации создан: "${title}"`);
+      res.json(quizData);
+      
+    } catch (aiError) {
+      console.error('❌ YandexGPT error:', aiError.message);
+      
+      const questions = [];
+      for (let i = 0; i < qCount; i++) {
+        questions.push({
+          question: `Какой ключевой аспект презентации "${title}" является наиболее важным?`,
+          options: [
+            'Понимание основной темы и её практическое применение',
+            'Запоминание всех терминов без понимания сути',
+            'Игнорирование примеров из презентации',
+            'Только теоретическое изучение без практики'
+          ],
+          correct: 0,
+          explanation: 'Понимание темы и её применение на практике — ключ к успешному усвоению материала презентации.'
+        });
+      }
+      
+      user = await decrementGenerations(user);
+      res.json({ title, questions, difficulty: 'medium', timeLimitMinutes: qCount * 2 });
     }
     
-    user = await decrementGenerations(user);
-    
-    res.json({ title: title, questions: questions, difficulty: 'medium', timeLimitMinutes: qCount * 2 });
   } catch (e) {
+    console.error('❌ Quiz from presentation error:', e.message);
     res.status(500).json({ error: 'Ошибка генерации теста' });
   }
 });
@@ -848,12 +960,10 @@ app.post('/api/report/generate', optionalAuth, async (req, res) => {
     let user = req.user;
     let slidesCount = Math.min(Math.max(slideCount, 3), 15);
     
-    // Проверка лимита слайдов для бесплатных пользователей
     if (!user.is_premium && !user.is_vip && slidesCount > 10) {
       slidesCount = 10;
     }
     
-    // Определяем тип отчёта
     let reportTypeName = 'Финансовый отчёт';
     if (reportType === 'annual') reportTypeName = 'Годовой отчёт';
     else if (reportType === 'esg') reportTypeName = 'ESG отчёт';
@@ -875,7 +985,6 @@ app.post('/api/report/generate', optionalAuth, async (req, res) => {
       });
     }
 
-    // Генерируем структуру в зависимости от количества слайдов
     let structure = '';
     if (reportType === 'esg') {
       structure = `1. Титульный лист
