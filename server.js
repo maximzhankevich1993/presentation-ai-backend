@@ -287,7 +287,7 @@ app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     timestamp: new Date().toISOString(), 
-    version: '8.0.0', 
+    version: '8.1.0', 
     api: 'YandexGPT',
     db: !!pool,
     uptime: process.uptime()
@@ -595,6 +595,13 @@ app.post('/api/generate', optionalAuth, async (req, res) => {
       presentation.slides = [];
     }
     
+    // Обрезаем лишние слайды
+    if (presentation.slides.length > slidesCount) {
+      console.log(`⚠️ AI сгенерировал ${presentation.slides.length} слайдов, обрезаем до ${slidesCount}`);
+      presentation.slides = presentation.slides.slice(0, slidesCount);
+    }
+    
+    // Добавляем недостающие слайды
     while (presentation.slides.length < slidesCount) {
       presentation.slides.push({
         title: `Слайд ${presentation.slides.length + 1}`,
@@ -724,6 +731,13 @@ app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
       lessonData.slides = [];
     }
     
+    // Обрезаем лишние слайды, если AI сгенерировал больше
+    if (lessonData.slides.length > slidesCount) {
+      console.log(`⚠️ AI сгенерировал ${lessonData.slides.length} слайдов, обрезаем до ${slidesCount}`);
+      lessonData.slides = lessonData.slides.slice(0, slidesCount);
+    }
+    
+    // Добавляем недостающие слайды
     while (lessonData.slides.length < slidesCount) {
       lessonData.slides.push({
         title: `${lessonData.slides.length + 1}. Вопрос по теме "${topic}"`,
@@ -816,6 +830,12 @@ app.post('/api/quiz/generate', optionalAuth, async (req, res) => {
       if (jsonMatch) cleanText = jsonMatch[0];
       
       let quizData = JSON.parse(cleanText);
+      
+      // Обрезаем лишние вопросы
+      if (quizData.questions && quizData.questions.length > qCount) {
+        console.log(`⚠️ AI сгенерировал ${quizData.questions.length} вопросов, обрезаем до ${qCount}`);
+        quizData.questions = quizData.questions.slice(0, qCount);
+      }
       
       user = await decrementGenerations(user);
       
@@ -926,6 +946,12 @@ ${slidesText}
       if (jsonMatch) cleanText = jsonMatch[0];
       
       let quizData = JSON.parse(cleanText);
+      
+      // Обрезаем лишние вопросы
+      if (quizData.questions && quizData.questions.length > qCount) {
+        console.log(`⚠️ AI сгенерировал ${quizData.questions.length} вопросов, обрезаем до ${qCount}`);
+        quizData.questions = quizData.questions.slice(0, qCount);
+      }
       
       user = await decrementGenerations(user);
       
@@ -1102,29 +1128,34 @@ ${structure}
       reportData.slides = [];
     }
     
-    const targetCount = slidesCount;
-    if (reportData.slides.length < targetCount) {
-      for (let i = reportData.slides.length; i < targetCount; i++) {
-        if (i === 0) {
-          reportData.slides.push({
-            title: 'Титульный лист',
-            content: [company, `Отчёт за ${period}`, standardName]
-          });
-        } else if (i === 1) {
-          reportData.slides.push({
-            title: 'Ключевые показатели',
-            content: ['Выручка: ________ млн ₽', 'Прибыль: ________ млн ₽', 'Рентабельность: ________%']
-          });
-        } else {
-          reportData.slides.push({
-            title: `Раздел ${i + 1}`,
-            content: [
-              `Дополнительный анализ по компании "${company}".`,
-              `Показатели соответствуют стандартам ${standardName}.`,
-              `Рекомендуется обновить информацию при наличии новых данных.`
-            ]
-          });
-        }
+    // Обрезаем лишние слайды
+    if (reportData.slides.length > slidesCount) {
+      console.log(`⚠️ AI сгенерировал ${reportData.slides.length} слайдов, обрезаем до ${slidesCount}`);
+      reportData.slides = reportData.slides.slice(0, slidesCount);
+    }
+    
+    // Добавляем недостающие слайды
+    while (reportData.slides.length < slidesCount) {
+      const i = reportData.slides.length;
+      if (i === 0) {
+        reportData.slides.push({
+          title: 'Титульный лист',
+          content: [company, `Отчёт за ${period}`, standardName]
+        });
+      } else if (i === 1) {
+        reportData.slides.push({
+          title: 'Ключевые показатели',
+          content: ['Выручка: ________ млн ₽', 'Прибыль: ________ млн ₽', 'Рентабельность: ________%']
+        });
+      } else {
+        reportData.slides.push({
+          title: `Раздел ${i + 1}`,
+          content: [
+            `Дополнительный анализ по компании "${company}".`,
+            `Показатели соответствуют стандартам ${standardName}.`,
+            `Рекомендуется обновить информацию при наличии новых данных.`
+          ]
+        });
       }
     }
 
@@ -1420,6 +1451,7 @@ initDatabase().then(() => {
     console.log(`📝 Генератор тестов: YandexGPT`);
     console.log(`🖼️ Поиск изображений: Unsplash + Picsum`);
     console.log(`📋 История генераций: включена`);
+    console.log(`✂️ Обрезка лишних слайдов: включена`);
     console.log(`⚡ Кэш включён, пинг включён`);
   });
 });
