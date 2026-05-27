@@ -80,7 +80,6 @@ if (!YANDEX_API_KEY || !YANDEX_FOLDER_ID) {
 // ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 // ═══════════════════════════════════════════════════════════════
 
-// Проверка и сброс ежемесячных генераций
 async function checkAndResetMonthlyGenerations(user) {
   if (!pool || user.id === 'guest') return user;
   
@@ -115,7 +114,6 @@ async function checkAndResetMonthlyGenerations(user) {
   return user;
 }
 
-// Уменьшение счётчика генераций
 async function decrementGenerations(user) {
   if (user.id === 'guest') {
     const newCount = (user.generations_used || 0) + 1;
@@ -289,7 +287,7 @@ app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     timestamp: new Date().toISOString(), 
-    version: '7.0.0', 
+    version: '8.0.0', 
     api: 'YandexGPT',
     db: !!pool,
     uptime: process.uptime()
@@ -485,7 +483,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
 
     await pool.query('INSERT INTO password_resets (user_id, token_hash) VALUES ($1, $2)', [user.id, resetTokenHash]);
 
-    const resetLink = `https://presentation-ai.com/reset-password?token=${resetToken}&email=${email}`;
+    const resetLink = `https://prezentator-ai.com/reset-password?token=${resetToken}&email=${email}`;
 
     await transporter.sendMail({
       from: `"Презентатор ИИ" <${FROM_EMAIL}>`,
@@ -740,6 +738,14 @@ app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
 
     user = await decrementGenerations(user);
     
+    if (pool && user.id !== 'guest') {
+      await pool.query(
+        `INSERT INTO generation_history (user_id, type, title, slide_count, created_at)
+         VALUES ($1, 'lesson', $2, $3, NOW())`,
+        [user.id, topic, slidesCount]
+      );
+    }
+    
     console.log(`✅ Урок создан: "${topic}" (${lessonData.slides.length} слайдов)`);
     res.json(lessonData);
     
@@ -812,6 +818,14 @@ app.post('/api/quiz/generate', optionalAuth, async (req, res) => {
       let quizData = JSON.parse(cleanText);
       
       user = await decrementGenerations(user);
+      
+      if (pool && user.id !== 'guest') {
+        await pool.query(
+          `INSERT INTO generation_history (user_id, type, title, slide_count, created_at)
+           VALUES ($1, 'quiz', $2, $3, NOW())`,
+          [user.id, topic, qCount]
+        );
+      }
       
       console.log(`✅ Тест создан: "${topic}" (${quizData.questions?.length || 0} вопросов)`);
       res.json(quizData);
@@ -914,6 +928,14 @@ ${slidesText}
       let quizData = JSON.parse(cleanText);
       
       user = await decrementGenerations(user);
+      
+      if (pool && user.id !== 'guest') {
+        await pool.query(
+          `INSERT INTO generation_history (user_id, type, title, slide_count, created_at)
+           VALUES ($1, 'quiz', $2, $3, NOW())`,
+          [user.id, title, qCount]
+        );
+      }
       
       console.log(`✅ Тест из презентации создан: "${title}"`);
       res.json(quizData);
@@ -1108,6 +1130,14 @@ ${structure}
 
     user = await decrementGenerations(user);
     
+    if (pool && user.id !== 'guest') {
+      await pool.query(
+        `INSERT INTO generation_history (user_id, type, title, slide_count, created_at)
+         VALUES ($1, 'report', $2, $3, NOW())`,
+        [user.id, company, slidesCount]
+      );
+    }
+    
     console.log(`✅ Отчёт создан: "${company}" (${reportData.slides.length} слайдов)`);
     res.json(reportData);
     
@@ -1173,16 +1203,49 @@ app.post('/api/export/pdf', optionalAuth, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// HISTORY, REFERRAL, VIP, IMAGES
+// HISTORY
 // ═══════════════════════════════════════════════════════════════
 app.get('/api/history', optionalAuth, async (req, res) => {
-  res.json({ history: [] });
+  try {
+    const user = req.user;
+    
+    if (user.id === 'guest' || !pool) {
+      return res.json({ history: [] });
+    }
+
+    const result = await pool.query(
+      `SELECT id, type, title, slide_count, created_at 
+       FROM generation_history 
+       WHERE user_id = $1 
+       ORDER BY created_at DESC 
+       LIMIT 20`,
+      [user.id]
+    );
+
+    const history = result.rows.map(row => ({
+      id: row.id,
+      type: row.type,
+      title: row.title,
+      slideCount: row.slide_count,
+      createdAt: row.created_at
+    }));
+
+    console.log(`📋 История для ${user.email}: ${history.length} записей`);
+    res.json({ history });
+    
+  } catch (e) {
+    console.error('❌ History error:', e.message);
+    res.json({ history: [] });
+  }
 });
 
 app.delete('/api/history/:id', optionalAuth, async (req, res) => {
   res.json({ success: true });
 });
 
+// ═══════════════════════════════════════════════════════════════
+// REFERRAL
+// ═══════════════════════════════════════════════════════════════
 app.get('/api/referral/stats', optionalAuth, async (req, res) => {
   res.json({ code: 'REF' + Math.random().toString(36).substring(2, 8).toUpperCase(), referralsCount: 0, bonusGenerations: 0, friends: [] });
 });
@@ -1199,6 +1262,9 @@ app.post('/api/referral/premium-activated', optionalAuth, async (req, res) => {
   res.json({ success: true });
 });
 
+// ═══════════════════════════════════════════════════════════════
+// VIP
+// ═══════════════════════════════════════════════════════════════
 app.get('/api/vip/stats', async (req, res) => {
   res.json({ occupiedSpots: 5, totalSpots: 50, availableSpots: 45 });
 });
@@ -1207,8 +1273,67 @@ app.post('/api/vip/purchase', optionalAuth, async (req, res) => {
   res.json({ success: true, message: 'VIP статус активирован' });
 });
 
+// ═══════════════════════════════════════════════════════════════
+// IMAGES SEARCH
+// ═══════════════════════════════════════════════════════════════
 app.post('/api/images/search', async (req, res) => {
-  res.json({ images: [] });
+  try {
+    const { query } = req.body;
+    if (!query) return res.json({ images: [] });
+
+    console.log(`🖼️ Поиск изображений: "${query}"`);
+
+    try {
+      const unsplashResponse = await axios.get('https://unsplash.com/napi/search/photos', {
+        params: { query, per_page: 5 },
+        headers: { 'Accept': 'application/json' },
+        timeout: 10000
+      });
+
+      if (unsplashResponse.data && unsplashResponse.data.results) {
+        const images = unsplashResponse.data.results.slice(0, 5).map(img => ({
+          url: img.urls?.regular || img.urls?.small,
+          thumb: img.urls?.thumb,
+          alt: img.alt_description || query,
+          author: img.user?.name,
+          source: 'Unsplash'
+        }));
+        
+        if (images.length > 0) {
+          console.log(`✅ Unsplash: ${images.length} изображений`);
+          return res.json({ images });
+        }
+      }
+    } catch (unsplashError) {
+      console.log('⚠️ Unsplash не ответил, пробуем fallback');
+    }
+
+    const fallbackImages = [];
+    for (let i = 0; i < 3; i++) {
+      fallbackImages.push({
+        url: `https://picsum.photos/800/600?random=${Date.now() + i}`,
+        thumb: `https://picsum.photos/200/150?random=${Date.now() + i}`,
+        alt: query,
+        author: 'Lorem Picsum',
+        source: 'Picsum'
+      });
+    }
+    
+    console.log(`📷 Fallback: ${fallbackImages.length} изображений`);
+    res.json({ images: fallbackImages });
+
+  } catch (e) {
+    console.error('❌ Image search error:', e.message);
+    res.json({ 
+      images: [{
+        url: `https://picsum.photos/800/600?random=${Date.now()}`,
+        thumb: `https://picsum.photos/200/150?random=${Date.now()}`,
+        alt: req.body.query || 'image',
+        author: 'Lorem Picsum',
+        source: 'Picsum'
+      }]
+    });
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════
@@ -1292,6 +1417,9 @@ initDatabase().then(() => {
     console.log(`🎁 Бесплатных генераций: 5 в месяц`);
     console.log(`📚 Конструктор уроков: полноценные уроки, до 10 слайдов`);
     console.log(`📊 Конструктор отчётов: полноценные отчёты, до 15 слайдов (бесплатно до 10)`);
+    console.log(`📝 Генератор тестов: YandexGPT`);
+    console.log(`🖼️ Поиск изображений: Unsplash + Picsum`);
+    console.log(`📋 История генераций: включена`);
     console.log(`⚡ Кэш включён, пинг включён`);
   });
 });
