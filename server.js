@@ -39,12 +39,10 @@ const pool = process.env.DATABASE_URL
 // КЭШ И СЧЁТЧИКИ
 // ═══════════════════════════════════════════════════════════════
 const generationCache = new Map();
-const CACHE_TTL = 1000 * 60 * 60; // 1 час
+const CACHE_TTL = 1000 * 60 * 60;
 
-// Счётчик для гостей (в памяти)
 const guestGenerationCounter = new Map();
 
-// Очистка счётчика гостей раз в сутки
 setInterval(() => {
   guestGenerationCounter.clear();
   console.log('🔄 Очищен счётчик гостей');
@@ -228,58 +226,6 @@ function getStandardName(code) {
   return standards[code] || code;
 }
 
-function getCountryNameForQuiz(code) {
-  const countries = {
-    'RU': 'Россия', 'BY': 'Беларусь', 'KZ': 'Казахстан',
-    'UA': 'Украина', 'US': 'США', 'GB': 'Великобритания',
-    'DE': 'Германия', 'FR': 'Франция', 'IT': 'Италия',
-    'ES': 'Испания', 'PL': 'Польша', 'TR': 'Турция',
-    'CN': 'Китай', 'IN': 'Индия', 'BR': 'Бразилия'
-  };
-  return countries[code] || 'международный';
-}
-
-function getDefaultStages(topic, durationMinutes) {
-  const stageMinutes = Math.floor(durationMinutes / 5);
-  return [
-    {
-      name: 'Организационный момент',
-      minutes: 5,
-      teacherActions: 'Приветствие, проверка готовности к уроку',
-      studentActions: 'Подготовка рабочих мест',
-      resources: 'Презентация, доска'
-    },
-    {
-      name: 'Актуализация знаний',
-      minutes: stageMinutes,
-      teacherActions: `Опрос по теме "${topic}", введение в новый материал`,
-      studentActions: 'Ответы на вопросы, обсуждение',
-      resources: 'Вопросы для обсуждения, карточки'
-    },
-    {
-      name: 'Изучение нового материала',
-      minutes: stageMinutes * 2,
-      teacherActions: `Объяснение темы "${topic}", демонстрация примеров`,
-      studentActions: 'Конспектирование, задавание вопросов',
-      resources: 'Видеоматериалы, схемы, таблицы'
-    },
-    {
-      name: 'Закрепление материала',
-      minutes: stageMinutes,
-      teacherActions: 'Практические задания, контроль понимания',
-      studentActions: 'Выполнение упражнений, работа в парах',
-      resources: 'Рабочие листы, карточки с заданиями'
-    },
-    {
-      name: 'Подведение итогов',
-      minutes: 5,
-      teacherActions: 'Анализ работы, выставление оценок',
-      studentActions: 'Рефлексия, вопросы по теме',
-      resources: 'Дневники, оценочные листы'
-    }
-  ];
-}
-
 // ═══════════════════════════════════════════════════════════════
 // HEALTH CHECK
 // ═══════════════════════════════════════════════════════════════
@@ -287,7 +233,7 @@ app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     timestamp: new Date().toISOString(), 
-    version: '8.1.0', 
+    version: '8.2.0', 
     api: 'YandexGPT',
     db: !!pool,
     uptime: process.uptime()
@@ -390,7 +336,6 @@ app.post('/api/auth/login', async (req, res) => {
 
   try {
     const { email, password } = req.body;
-    console.log('🔐 Вход:', email);
     
     if (!email || !password) {
       return res.status(400).json({ error: 'Email и пароль обязательны' });
@@ -405,12 +350,10 @@ app.post('/api/auth/login', async (req, res) => {
     );
 
     if (result.rows.length === 0) {
-      console.log('❌ Пользователь не найден:', email);
       return res.status(401).json({ error: 'Неверный email или пароль' });
     }
 
     let user = result.rows[0];
-    console.log('✅ Пользователь найден:', user.email);
 
     if (user.locked_until && new Date(user.locked_until) > new Date()) {
       return res.status(423).json({ error: 'Аккаунт заблокирован' });
@@ -418,15 +361,12 @@ app.post('/api/auth/login', async (req, res) => {
 
     const valid = await bcrypt.compare(password, user.password_hash);
     if (!valid) {
-      console.log('❌ Неверный пароль');
       await pool.query(
         'UPDATE users SET failed_login_attempts = failed_login_attempts + 1 WHERE id = $1',
         [user.id]
       );
       return res.status(401).json({ error: 'Неверный email или пароль' });
     }
-
-    console.log('✅ Пароль верный');
 
     user = await checkAndResetMonthlyGenerations(user);
 
@@ -443,7 +383,6 @@ app.post('/api/auth/login', async (req, res) => {
         `INSERT INTO sessions (user_id, token_hash, expires_at) VALUES ($1, $2, NOW() + INTERVAL '30 days')`,
         [user.id, tokenHash]
       );
-      console.log('✅ Сессия создана');
     } catch (err) {
       console.log('Sessions table error:', err.message);
     }
@@ -464,39 +403,6 @@ app.post('/api/auth/login', async (req, res) => {
   } catch (e) {
     console.error('❌ Login error:', e);
     res.status(500).json({ error: 'Ошибка входа: ' + e.message });
-  }
-});
-
-app.post('/api/auth/forgot-password', async (req, res) => {
-  if (!pool) return res.json({ success: true, message: 'Если email зарегистрирован, ссылка отправлена' });
-
-  try {
-    const { email } = req.body;
-    if (!email) return res.status(400).json({ error: 'Email обязателен' });
-
-    const result = await pool.query('SELECT id, name FROM users WHERE email = $1', [email.toLowerCase()]);
-    if (result.rows.length === 0) return res.json({ success: true, message: 'Если email зарегистрирован, ссылка отправлена' });
-
-    const user = result.rows[0];
-    const resetToken = crypto.randomBytes(32).toString('hex');
-    const resetTokenHash = await bcrypt.hash(resetToken, 10);
-
-    await pool.query('INSERT INTO password_resets (user_id, token_hash) VALUES ($1, $2)', [user.id, resetTokenHash]);
-
-    const resetLink = `https://prezentator-ai.com/reset-password?token=${resetToken}&email=${email}`;
-
-    await transporter.sendMail({
-      from: `"Презентатор ИИ" <${FROM_EMAIL}>`,
-      to: email,
-      subject: 'Восстановление пароля',
-      html: `<h2>Сброс пароля</h2><p>Здравствуйте, ${user.name}!</p><a href="${resetLink}" style="padding:14px 28px;background:#1DB954;color:white;text-decoration:none;border-radius:8px;">Сбросить пароль</a><p style="color:#666;font-size:12px;">Ссылка действительна 1 час.</p>`
-    });
-
-    console.log(`✅ Письмо сброса: ${email}`);
-    res.json({ success: true, message: 'Ссылка отправлена на email' });
-  } catch (e) {
-    console.error('Forgot:', e);
-    res.status(500).json({ error: 'Ошибка' });
   }
 });
 
@@ -525,7 +431,6 @@ app.post('/api/generate', optionalAuth, async (req, res) => {
     if (!topic) return res.status(400).json({ error: 'Тема не указана' });
 
     let user = req.user;
-    console.log(`🎯 Генерация: "${topic}" (${slidesCount} слайдов) - ${user.email}, осталось: ${user.free_generations_left}`);
 
     if (user.free_generations_left <= 0) {
       return res.status(402).json({ 
@@ -547,20 +452,15 @@ app.post('/api/generate', optionalAuth, async (req, res) => {
     
     if (generationCache.has(cacheKey)) {
       const cached = generationCache.get(cacheKey);
-      console.log(`📦 Кэш: "${topic}" - ${user.email}`);
-      
       user = await decrementGenerations(user);
       return res.json(cached);
     }
-
-    const minWords = 45;
-    const maxWords = 60;
 
     const prompt = `Ты — эксперт по созданию презентаций. Создай структуру презентации на тему: "${topic}". Количество слайдов: ${slidesCount}.
 
 ПРАВИЛА:
 - Каждый слайд: ЗАГОЛОВОК (5-8 слов) + 4-6 пунктов
-- Длина КАЖДОГО пункта: ${minWords}-${maxWords} слов
+- Длина КАЖДОГО пункта: 45-60 слов
 - Используй: цифры, проценты, даты, статистику, примеры из реальной жизни
 
 Верни ТОЛЬКО JSON в формате:
@@ -595,13 +495,11 @@ app.post('/api/generate', optionalAuth, async (req, res) => {
       presentation.slides = [];
     }
     
-    // Обрезаем лишние слайды
     if (presentation.slides.length > slidesCount) {
       console.log(`⚠️ AI сгенерировал ${presentation.slides.length} слайдов, обрезаем до ${slidesCount}`);
       presentation.slides = presentation.slides.slice(0, slidesCount);
     }
     
-    // Добавляем недостающие слайды
     while (presentation.slides.length < slidesCount) {
       presentation.slides.push({
         title: `Слайд ${presentation.slides.length + 1}`,
@@ -627,7 +525,6 @@ app.post('/api/generate', optionalAuth, async (req, res) => {
       );
     }
     
-    console.log(`✅ ${presentation.slides?.length || 0} слайдов`);
     res.json(presentation);
     
   } catch (e) {
@@ -671,8 +568,6 @@ app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
         message: 'В бесплатной версии максимум 10 слайдов. Оформите подписку для создания более подробных уроков.'
       });
     }
-    
-    console.log(`📚 Генерация урока: "${topic}" (${slidesCount} слайдов, ${subject}) - ${user.email}, осталось: ${user.free_generations_left}`);
 
     if (user.free_generations_left <= 0) {
       return res.status(402).json({ 
@@ -731,24 +626,8 @@ app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
       lessonData.slides = [];
     }
     
-    // Обрезаем лишние слайды, если AI сгенерировал больше
-    if (lessonData.slides.length > slidesCount) {
-      console.log(`⚠️ AI сгенерировал ${lessonData.slides.length} слайдов, обрезаем до ${slidesCount}`);
-      lessonData.slides = lessonData.slides.slice(0, slidesCount);
-    }
-    
-    // Добавляем недостающие слайды
-    while (lessonData.slides.length < slidesCount) {
-      lessonData.slides.push({
-        title: `${lessonData.slides.length + 1}. Вопрос по теме "${topic}"`,
-        content: [
-          `Ключевой аспект темы "${topic}" требует внимательного изучения.`,
-          `Статистика показывает важность этого вопроса в ${subject}.`,
-          `Как вы думаете, почему это важно для понимания темы?`,
-          `Рекомендуется запомнить этот материал для дальнейшего изучения.`
-        ]
-      });
-    }
+    // Для уроков не обрезаем — фронтенд сам добавит 3 слайда
+    console.log(`📚 AI сгенерировал ${lessonData.slides.length} слайдов урока`);
 
     user = await decrementGenerations(user);
     
@@ -780,8 +659,6 @@ app.post('/api/quiz/generate', optionalAuth, async (req, res) => {
     
     let user = req.user;
     const qCount = Math.min(Math.max(questionCount, 3), 10);
-    
-    console.log(`📝 Генерация теста: "${topic}" - ${user.email}, осталось: ${user.free_generations_left}`);
 
     if (user.free_generations_left <= 0) {
       return res.status(402).json({ 
@@ -831,7 +708,6 @@ app.post('/api/quiz/generate', optionalAuth, async (req, res) => {
       
       let quizData = JSON.parse(cleanText);
       
-      // Обрезаем лишние вопросы
       if (quizData.questions && quizData.questions.length > qCount) {
         console.log(`⚠️ AI сгенерировал ${quizData.questions.length} вопросов, обрезаем до ${qCount}`);
         quizData.questions = quizData.questions.slice(0, qCount);
@@ -888,8 +764,6 @@ app.post('/api/quiz/from-presentation', optionalAuth, async (req, res) => {
     
     let user = req.user;
     const qCount = Math.min(Math.max(questionCount, 3), 10);
-    
-    console.log(`📝 Генерация теста из презентации: "${title}" - ${user.email}`);
 
     if (user.free_generations_left <= 0) {
       return res.status(402).json({ 
@@ -947,7 +821,6 @@ ${slidesText}
       
       let quizData = JSON.parse(cleanText);
       
-      // Обрезаем лишние вопросы
       if (quizData.questions && quizData.questions.length > qCount) {
         console.log(`⚠️ AI сгенерировал ${quizData.questions.length} вопросов, обрезаем до ${qCount}`);
         quizData.questions = quizData.questions.slice(0, qCount);
@@ -1022,8 +895,6 @@ app.post('/api/report/generate', optionalAuth, async (req, res) => {
     else if (standard === 'gaap') standardName = 'US GAAP';
     else if (standard === 'rsbu') standardName = 'РСБУ';
     else if (standard === 'gri') standardName = 'GRI';
-    
-    console.log(`📊 Генерация отчёта: "${company}" (${slidesCount} слайдов, ${reportTypeName}, ${standardName}) - ${user.email}, осталось: ${user.free_generations_left}`);
 
     if (user.free_generations_left <= 0) {
       return res.status(402).json({ 
@@ -1037,9 +908,9 @@ app.post('/api/report/generate', optionalAuth, async (req, res) => {
     if (reportType === 'esg') {
       structure = `1. Титульный лист
 2. Обзор ESG-стратегии
-3. Экологические показатели (выбросы CO2, энергопотребление, отходы)
-4. Социальные показатели (сотрудники, безопасность, обучение)
-5. Управленческие показатели (комплаенс, антикоррупция)
+3. Экологические показатели
+4. Социальные показатели
+5. Управленческие показатели
 6. Достижения и сертификаты
 7. Цели на следующий период
 8. Выводы и рекомендации`;
@@ -1061,11 +932,11 @@ app.post('/api/report/generate', optionalAuth, async (req, res) => {
     } else {
       structure = `1. Титульный лист
 2. Executive summary
-3. Ключевые финансовые показатели (выручка, EBITDA, чистая прибыль)
+3. Ключевые финансовые показатели
 4. Анализ доходов по сегментам
 5. Анализ расходов по категориям
 6. Анализ рентабельности
-7. Анализ ликвидности (коэффициенты)
+7. Анализ ликвидности
 8. Анализ долговой нагрузки
 9. Анализ денежного потока
 10. Сравнение с предыдущим периодом
@@ -1128,35 +999,20 @@ ${structure}
       reportData.slides = [];
     }
     
-    // Обрезаем лишние слайды
     if (reportData.slides.length > slidesCount) {
-      console.log(`⚠️ AI сгенерировал ${reportData.slides.length} слайдов, обрезаем до ${slidesCount}`);
       reportData.slides = reportData.slides.slice(0, slidesCount);
     }
     
-    // Добавляем недостающие слайды
     while (reportData.slides.length < slidesCount) {
       const i = reportData.slides.length;
-      if (i === 0) {
-        reportData.slides.push({
-          title: 'Титульный лист',
-          content: [company, `Отчёт за ${period}`, standardName]
-        });
-      } else if (i === 1) {
-        reportData.slides.push({
-          title: 'Ключевые показатели',
-          content: ['Выручка: ________ млн ₽', 'Прибыль: ________ млн ₽', 'Рентабельность: ________%']
-        });
-      } else {
-        reportData.slides.push({
-          title: `Раздел ${i + 1}`,
-          content: [
-            `Дополнительный анализ по компании "${company}".`,
-            `Показатели соответствуют стандартам ${standardName}.`,
-            `Рекомендуется обновить информацию при наличии новых данных.`
-          ]
-        });
-      }
+      reportData.slides.push({
+        title: `Раздел ${i + 1}`,
+        content: [
+          `Дополнительный анализ по компании "${company}".`,
+          `Показатели соответствуют стандартам ${standardName}.`,
+          `Рекомендуется обновить информацию при наличии новых данных.`
+        ]
+      });
     }
 
     user = await decrementGenerations(user);
@@ -1169,7 +1025,6 @@ ${structure}
       );
     }
     
-    console.log(`✅ Отчёт создан: "${company}" (${reportData.slides.length} слайдов)`);
     res.json(reportData);
     
   } catch (e) {
@@ -1208,29 +1063,15 @@ app.post('/api/improve', optionalAuth, async (req, res) => {
 // EXPORT
 // ═══════════════════════════════════════════════════════════════
 app.post('/api/export/pptx', optionalAuth, async (req, res) => {
-  try {
-    const { title } = req.body;
-    console.log(`📤 Экспорт PPTX: "${title}"`);
-    res.json({ success: true, message: 'PPTX готов' });
-  } catch (error) {
-    res.status(500).json({ error: 'Ошибка экспорта PPTX' });
-  }
+  res.json({ success: true, message: 'PPTX готов' });
 });
 
 app.post('/api/export/pdf', optionalAuth, async (req, res) => {
-  try {
-    const { title } = req.body;
-    const user = req.user;
-    
-    if (!user.is_premium && !user.is_vip && user.id !== 'guest') {
-      return res.status(403).json({ error: 'Premium доступ required' });
-    }
-    
-    console.log(`📤 Экспорт PDF: "${title}"`);
-    res.json({ success: true, message: 'PDF готов' });
-  } catch (error) {
-    res.status(500).json({ error: 'Ошибка экспорта PDF' });
+  const user = req.user;
+  if (!user.is_premium && !user.is_vip && user.id !== 'guest') {
+    return res.status(403).json({ error: 'Premium доступ required' });
   }
+  res.json({ success: true, message: 'PDF готов' });
 });
 
 // ═══════════════════════════════════════════════════════════════
@@ -1253,117 +1094,69 @@ app.get('/api/history', optionalAuth, async (req, res) => {
       [user.id]
     );
 
-    const history = result.rows.map(row => ({
+    res.json({ history: result.rows.map(row => ({
       id: row.id,
       type: row.type,
       title: row.title,
       slideCount: row.slide_count,
       createdAt: row.created_at
-    }));
-
-    console.log(`📋 История для ${user.email}: ${history.length} записей`);
-    res.json({ history });
+    }))});
     
   } catch (e) {
-    console.error('❌ History error:', e.message);
     res.json({ history: [] });
   }
 });
 
-app.delete('/api/history/:id', optionalAuth, async (req, res) => {
-  res.json({ success: true });
-});
-
 // ═══════════════════════════════════════════════════════════════
-// REFERRAL
+// PAYMENT CALLBACK (CryptoCloud Postback)
 // ═══════════════════════════════════════════════════════════════
-app.get('/api/referral/stats', optionalAuth, async (req, res) => {
-  res.json({ code: 'REF' + Math.random().toString(36).substring(2, 8).toUpperCase(), referralsCount: 0, bonusGenerations: 0, friends: [] });
-});
-
-app.post('/api/referral/apply', async (req, res) => {
-  res.json({ success: true });
-});
-
-app.post('/api/referral/activate', optionalAuth, async (req, res) => {
-  res.json({ success: true });
-});
-
-app.post('/api/referral/premium-activated', optionalAuth, async (req, res) => {
-  res.json({ success: true });
-});
-
-// ═══════════════════════════════════════════════════════════════
-// VIP
-// ═══════════════════════════════════════════════════════════════
-app.get('/api/vip/stats', async (req, res) => {
-  res.json({ occupiedSpots: 5, totalSpots: 50, availableSpots: 45 });
-});
-
-app.post('/api/vip/purchase', optionalAuth, async (req, res) => {
-  res.json({ success: true, message: 'VIP статус активирован' });
-});
-
-// ═══════════════════════════════════════════════════════════════
-// IMAGES SEARCH
-// ═══════════════════════════════════════════════════════════════
-app.post('/api/images/search', async (req, res) => {
+app.post('/api/payment/callback', async (req, res) => {
   try {
-    const { query } = req.body;
-    if (!query) return res.json({ images: [] });
-
-    console.log(`🖼️ Поиск изображений: "${query}"`);
-
-    try {
-      const unsplashResponse = await axios.get('https://unsplash.com/napi/search/photos', {
-        params: { query, per_page: 5 },
-        headers: { 'Accept': 'application/json' },
-        timeout: 10000
-      });
-
-      if (unsplashResponse.data && unsplashResponse.data.results) {
-        const images = unsplashResponse.data.results.slice(0, 5).map(img => ({
-          url: img.urls?.regular || img.urls?.small,
-          thumb: img.urls?.thumb,
-          alt: img.alt_description || query,
-          author: img.user?.name,
-          source: 'Unsplash'
-        }));
-        
-        if (images.length > 0) {
-          console.log(`✅ Unsplash: ${images.length} изображений`);
-          return res.json({ images });
-        }
-      }
-    } catch (unsplashError) {
-      console.log('⚠️ Unsplash не ответил, пробуем fallback');
-    }
-
-    const fallbackImages = [];
-    for (let i = 0; i < 3; i++) {
-      fallbackImages.push({
-        url: `https://picsum.photos/800/600?random=${Date.now() + i}`,
-        thumb: `https://picsum.photos/200/150?random=${Date.now() + i}`,
-        alt: query,
-        author: 'Lorem Picsum',
-        source: 'Picsum'
-      });
+    console.log('💰 Payment callback:', JSON.stringify(req.body));
+    
+    const { order_id, status, amount, currency, plan } = req.body;
+    
+    // Проверяем, что платёж успешен
+    if (status !== 'success' && status !== 'completed') {
+      console.log(`⚠️ Платёж не успешен: ${status}`);
+      return res.json({ success: true });
     }
     
-    console.log(`📷 Fallback: ${fallbackImages.length} изображений`);
-    res.json({ images: fallbackImages });
-
+    if (!pool) {
+      console.log('⚠️ Нет БД, пропускаем активацию');
+      return res.json({ success: true });
+    }
+    
+    // Определяем срок подписки в зависимости от плана
+    let durationMonths = 1;
+    if (plan === 'Полгода' || plan === 'half') durationMonths = 6;
+    else if (plan === 'Год' || plan === 'year') durationMonths = 12;
+    
+    const expiry = new Date();
+    expiry.setMonth(expiry.getMonth() + durationMonths);
+    
+    // Ищем пользователя по order_id (если передавался email)
+    if (req.body.email) {
+      await pool.query(
+        `UPDATE users 
+         SET is_premium = TRUE, 
+             premium_expiry = $1,
+             free_generations_left = 9999,
+             monthly_generations_left = 9999
+         WHERE email = $2`,
+        [expiry, req.body.email.toLowerCase()]
+      );
+      
+      console.log(`✅ Premium активирован для ${req.body.email} до ${expiry}`);
+    } else {
+      console.log('⚠️ Нет email в колбэке, пропускаем активацию');
+    }
+    
+    res.json({ success: true });
+    
   } catch (e) {
-    console.error('❌ Image search error:', e.message);
-    res.json({ 
-      images: [{
-        url: `https://picsum.photos/800/600?random=${Date.now()}`,
-        thumb: `https://picsum.photos/200/150?random=${Date.now()}`,
-        alt: req.body.query || 'image',
-        author: 'Lorem Picsum',
-        source: 'Picsum'
-      }]
-    });
+    console.error('❌ Payment callback error:', e.message);
+    res.status(500).json({ error: 'Ошибка обработки платежа' });
   }
 });
 
@@ -1432,26 +1225,16 @@ async function initDatabase() {
   }
 }
 
-// Пинг для предотвращения холодного старта
 setInterval(async () => {
   try {
     await axios.get(`http://localhost:${PORT}/api/health`, { timeout: 5000 });
-  } catch (e) {
-    // тихо
-  }
+  } catch (e) {}
 }, 300000);
 
 initDatabase().then(() => {
   app.listen(PORT, () => {
     console.log(`🚀 Сервер на порту ${PORT}`);
     console.log(`📊 БД: ${pool ? 'подключена' : 'DEMO режим'}`);
-    console.log(`🎁 Бесплатных генераций: 5 в месяц`);
-    console.log(`📚 Конструктор уроков: полноценные уроки, до 10 слайдов`);
-    console.log(`📊 Конструктор отчётов: полноценные отчёты, до 15 слайдов (бесплатно до 10)`);
-    console.log(`📝 Генератор тестов: YandexGPT`);
-    console.log(`🖼️ Поиск изображений: Unsplash + Picsum`);
-    console.log(`📋 История генераций: включена`);
-    console.log(`✂️ Обрезка лишних слайдов: включена`);
-    console.log(`⚡ Кэш включён, пинг включён`);
+    console.log(`💰 Postback URL: /api/payment/callback`);
   });
 });
