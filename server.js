@@ -153,13 +153,11 @@ async function checkBonusMonth(userId) {
     );
     
     if (result.rows.length > 0) {
-      // Активируем бонусный месяц
       await pool.query(
         `UPDATE user_bonus_months SET is_used = TRUE WHERE id = $1`,
         [result.rows[0].id]
       );
       
-      // Продлеваем подписку на месяц
       await pool.query(
         `UPDATE users 
          SET premium_expiry = premium_expiry + INTERVAL '1 month'
@@ -269,7 +267,7 @@ app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     timestamp: new Date().toISOString(), 
-    version: '8.3.0', 
+    version: '8.4.0', 
     api: 'YandexGPT',
     db: !!pool,
     uptime: process.uptime()
@@ -500,7 +498,6 @@ app.get('/api/profile', optionalAuth, async (req, res) => {
     
     const dbUser = result.rows[0];
     
-    // Проверяем бонусный месяц
     const bonusResult = await pool.query(
       `SELECT * FROM user_bonus_months 
        WHERE user_id = $1 AND is_used = FALSE AND bonus_month = 2`,
@@ -529,7 +526,6 @@ app.get('/api/profile', optionalAuth, async (req, res) => {
 // PROMOCODES
 // ═══════════════════════════════════════════════════════════════
 
-// Проверка промокода (без активации)
 app.post('/api/promocode/validate', optionalAuth, async (req, res) => {
   try {
     const { code } = req.body;
@@ -553,12 +549,16 @@ app.post('/api/promocode/validate', optionalAuth, async (req, res) => {
     );
     
     if (result.rows.length === 0) {
+      await pool.query(
+        `INSERT INTO promocode_analytics (promocode_id, action, user_id, created_at)
+         VALUES (NULL, 'invalid_attempt', $1, NOW())`,
+        [user.id !== 'guest' ? user.id : null]
+      );
       return res.status(404).json({ valid: false, message: 'Invalid or expired promo code' });
     }
     
     const promocode = result.rows[0];
     
-    // Проверка, не использовал ли уже этот пользователь данный код
     if (user.id !== 'guest') {
       const usageCheck = await pool.query(
         `SELECT * FROM promocode_usages WHERE promocode_id = $1 AND user_id = $2`,
@@ -566,9 +566,20 @@ app.post('/api/promocode/validate', optionalAuth, async (req, res) => {
       );
       
       if (usageCheck.rows.length > 0) {
+        await pool.query(
+          `INSERT INTO promocode_analytics (promocode_id, action, user_id, created_at)
+           VALUES ($1, 'already_used', $2, NOW())`,
+          [promocode.id, user.id]
+        );
         return res.status(400).json({ valid: false, message: 'You have already used this promo code' });
       }
     }
+    
+    await pool.query(
+      `INSERT INTO promocode_analytics (promocode_id, action, user_id, created_at)
+       VALUES ($1, 'validate', $2, NOW())`,
+      [promocode.id, user.id !== 'guest' ? user.id : null]
+    );
     
     res.json({
       valid: true,
@@ -584,10 +595,9 @@ app.post('/api/promocode/validate', optionalAuth, async (req, res) => {
   }
 });
 
-// Активация промокода и получение цены со скидкой
 app.post('/api/promocode/apply', optionalAuth, async (req, res) => {
   try {
-    const { code, plan } = req.body; // plan: 'monthly', 'half_year', 'year'
+    const { code, plan } = req.body;
     const user = req.user;
     
     if (!code || !plan) {
@@ -609,12 +619,16 @@ app.post('/api/promocode/apply', optionalAuth, async (req, res) => {
     );
     
     if (result.rows.length === 0) {
+      await pool.query(
+        `INSERT INTO promocode_analytics (promocode_id, action, user_id, created_at)
+         VALUES (NULL, 'apply_failed', $1, NOW())`,
+        [user.id !== 'guest' ? user.id : null]
+      );
       return res.status(404).json({ success: false, message: 'Invalid or expired promo code' });
     }
     
     const promocode = result.rows[0];
     
-    // Проверка использования пользователем
     if (user.id !== 'guest') {
       const usageCheck = await pool.query(
         `SELECT * FROM promocode_usages WHERE promocode_id = $1 AND user_id = $2`,
@@ -622,11 +636,15 @@ app.post('/api/promocode/apply', optionalAuth, async (req, res) => {
       );
       
       if (usageCheck.rows.length > 0) {
+        await pool.query(
+          `INSERT INTO promocode_analytics (promocode_id, action, user_id, created_at)
+           VALUES ($1, 'already_used', $2, NOW())`,
+          [promocode.id, user.id]
+        );
         return res.status(400).json({ success: false, message: 'You have already used this promo code' });
       }
     }
     
-    // Цены без скидки
     const prices = { monthly: 4.99, half_year: 29.99, year: 49.99 };
     let originalPrice = prices[plan] || 4.99;
     let finalPrice = originalPrice;
@@ -636,12 +654,10 @@ app.post('/api/promocode/apply', optionalAuth, async (req, res) => {
       finalPrice = originalPrice * (1 - promocode.discount_value / 100);
       discountApplied = true;
     } else if (promocode.discount_type === 'free_month') {
-      // Для CRYPTO10: платит полную цену, но получает второй месяц бесплатно
       finalPrice = originalPrice;
       discountApplied = true;
     }
     
-    // Записываем использование
     await pool.query(
       `INSERT INTO promocode_usages (promocode_id, user_id) VALUES ($1, $2)`,
       [promocode.id, user.id]
@@ -652,7 +668,6 @@ app.post('/api/promocode/apply', optionalAuth, async (req, res) => {
       [promocode.id]
     );
     
-    // Для free_month: записываем бонус на второй месяц
     if (promocode.discount_type === 'free_month' && user.id !== 'guest') {
       await pool.query(
         `INSERT INTO user_bonus_months (user_id, bonus_month, applied_at, promocode_id, is_used)
@@ -660,6 +675,12 @@ app.post('/api/promocode/apply', optionalAuth, async (req, res) => {
         [user.id, 2, promocode.id]
       );
     }
+    
+    await pool.query(
+      `INSERT INTO promocode_analytics (promocode_id, action, user_id, created_at)
+       VALUES ($1, 'apply_success', $2, NOW())`,
+      [promocode.id, user.id]
+    );
     
     res.json({
       success: true,
@@ -1392,22 +1413,30 @@ app.post('/api/payment/callback', async (req, res) => {
     
     // Определяем срок подписки
     let durationMonths = 1;
-    if (plan === 'Полгода' || plan === 'half_year' || plan === 'half') durationMonths = 6;
-    else if (plan === 'Год' || plan === 'year') durationMonths = 12;
+    let planName = 'monthly';
+    if (plan === 'Полгода' || plan === 'half_year' || plan === 'half') {
+      durationMonths = 6;
+      planName = 'half_year';
+    } else if (plan === 'Год' || plan === 'year') {
+      durationMonths = 12;
+      planName = 'year';
+    }
     
     const expiry = new Date();
     expiry.setMonth(expiry.getMonth() + durationMonths);
     
-    // Ищем пользователя по email или order_id
+    // Ищем пользователя по email
     let userId = null;
+    let userEmail = null;
     
     if (email) {
       const userResult = await pool.query(
-        'SELECT id, is_premium FROM users WHERE email = $1',
+        'SELECT id, email FROM users WHERE email = $1',
         [email.toLowerCase()]
       );
       if (userResult.rows.length > 0) {
         userId = userResult.rows[0].id;
+        userEmail = userResult.rows[0].email;
       }
     }
     
@@ -1425,6 +1454,13 @@ app.post('/api/payment/callback', async (req, res) => {
       
       console.log(`✅ Premium activated for user ${userId} until ${expiry}`);
       
+      // Сохраняем информацию о подписке
+      await pool.query(
+        `INSERT INTO user_subscriptions (user_id, plan, amount, expires_at, created_at)
+         VALUES ($1, $2, $3, $4, NOW())`,
+        [userId, planName, amount, expiry]
+      );
+      
       // Проверяем, есть ли бонусный месяц (CRYPTO10)
       const bonusResult = await pool.query(
         `SELECT * FROM user_bonus_months 
@@ -1433,13 +1469,11 @@ app.post('/api/payment/callback', async (req, res) => {
       );
       
       if (bonusResult.rows.length > 0) {
-        // Отмечаем бонус как использованный
         await pool.query(
           `UPDATE user_bonus_months SET is_used = TRUE WHERE id = $1`,
           [bonusResult.rows[0].id]
         );
         
-        // Продлеваем подписку на месяц
         await pool.query(
           `UPDATE users 
            SET premium_expiry = premium_expiry + INTERVAL '1 month'
@@ -1449,6 +1483,46 @@ app.post('/api/payment/callback', async (req, res) => {
         
         console.log(`🎁 Bonus second month applied for user ${userId}`);
       }
+      
+      // Отправляем email-уведомление
+      if (userEmail) {
+        try {
+          const expiryDate = expiry.toLocaleDateString('ru-RU');
+          await transporter.sendMail({
+            from: `"Презентатор ИИ" <${FROM_EMAIL}>`,
+            to: userEmail,
+            subject: 'Подписка активирована! 🎉',
+            html: `
+              <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background: #121212; color: #ffffff; border-radius: 16px;">
+                <h2 style="color: #1DB954;">Спасибо за покупку!</h2>
+                <p>Ваша Premium-подписка активирована.</p>
+                <p><strong>План:</strong> ${planName === 'monthly' ? 'Месячный' : planName === 'half_year' ? '6 месяцев' : 'Годовой'}</p>
+                <p><strong>Действует до:</strong> ${expiryDate}</p>
+                <p>Теперь у вас безлимитный доступ ко всем функциям:</p>
+                <ul>
+                  <li>✅ Безлимит презентаций</li>
+                  <li>✅ До 50 слайдов</li>
+                  <li>✅ Экспорт в PDF без водяного знака</li>
+                  <li>✅ Загрузка своих картинок и логотипов</li>
+                </ul>
+                <a href="https://app.prezentator-ai.com" style="display: inline-block; background: #1DB954; color: #000; padding: 12px 24px; text-decoration: none; border-radius: 8px; margin-top: 16px; font-weight: bold;">Перейти в приложение</a>
+                <p style="margin-top: 24px; font-size: 12px; color: #666;">Если у вас есть вопросы, ответьте на это письмо или напишите в поддержку.</p>
+              </div>
+            `
+          });
+          console.log(`📧 Email sent to ${userEmail}`);
+        } catch (emailError) {
+          console.error('❌ Failed to send email:', emailError.message);
+        }
+      }
+      
+      // Записываем аналитику
+      await pool.query(
+        `INSERT INTO promocode_analytics (promocode_id, action, user_id, created_at)
+         VALUES ($1, 'payment_success', $2, NOW())`,
+        [promo_code ? (await pool.query('SELECT id FROM promocodes WHERE code = $1', [promo_code])).rows[0]?.id : null, userId]
+      );
+      
     } else {
       console.log('⚠️ No user found for payment');
     }
@@ -1548,6 +1622,23 @@ async function initDatabase() {
         applied_at TIMESTAMP DEFAULT NOW(),
         promocode_id INTEGER REFERENCES promocodes(id),
         is_used BOOLEAN DEFAULT FALSE
+      );
+      
+      CREATE TABLE IF NOT EXISTS user_subscriptions (
+        id SERIAL PRIMARY KEY,
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        plan VARCHAR(50) NOT NULL,
+        amount DECIMAL(10,2),
+        expires_at TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      
+      CREATE TABLE IF NOT EXISTS promocode_analytics (
+        id SERIAL PRIMARY KEY,
+        promocode_id INTEGER REFERENCES promocodes(id),
+        action VARCHAR(50),
+        user_id UUID REFERENCES users(id),
+        created_at TIMESTAMPTZ DEFAULT NOW()
       );
     `);
     console.log('✅ Tables created');
