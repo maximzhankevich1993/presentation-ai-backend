@@ -56,7 +56,7 @@ const YANDEX_URL = 'https://llm.api.cloud.yandex.net/foundationModels/v1/complet
 
 // ═══════════════════════════════════════════════════════════════
 // UNSPLASH
-// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
 const UNSPLASH_ACCESS_KEY = process.env.UNSPLASH_ACCESS_KEY;
 
 async function getImageUrl(query) {
@@ -97,8 +97,11 @@ if (!YANDEX_API_KEY || !YANDEX_FOLDER_ID) {
 // ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 // ═══════════════════════════════════════════════════════════════
 
+// Сброс месячного лимита (если новый месяц)
 async function checkAndResetMonthlyGenerations(user) {
   if (!pool || user.id === 'guest') return user;
+  if (user.is_premium || user.is_vip) return user;
+  
   try {
     const now = new Date();
     const lastReset = user.last_reset_date ? new Date(user.last_reset_date) : null;
@@ -106,18 +109,19 @@ async function checkAndResetMonthlyGenerations(user) {
       now.getMonth() !== lastReset.getMonth() || 
       now.getFullYear() !== lastReset.getFullYear();
     
-    if (needReset && !user.is_premium && !user.is_vip) {
+    if (needReset) {
       await pool.query(
         `UPDATE users 
          SET monthly_generations_left = 5, 
-             last_reset_date = NOW(),
-             free_generations_left = 5
+             free_generations_left = 5,
+             last_reset_date = NOW()
          WHERE id = $1`,
         [user.id]
       );
       user.monthly_generations_left = 5;
       user.free_generations_left = 5;
       user.last_reset_date = now;
+      console.log(`🔄 Сброс лимита для ${user.email} до 5`);
     }
   } catch (e) {
     console.error('Ошибка сброса лимита:', e);
@@ -125,7 +129,9 @@ async function checkAndResetMonthlyGenerations(user) {
   return user;
 }
 
+// Уменьшаем счётчик генераций
 async function decrementGenerations(user) {
+  // Гость — локальный счётчик
   if (user.id === 'guest') {
     const newCount = (user.generations_used || 0) + 1;
     guestGenerationCounter.set(user.guestId, newCount);
@@ -133,21 +139,39 @@ async function decrementGenerations(user) {
     user.generations_used = newCount;
     return user;
   }
+  
   if (!pool) return user;
   
-  const newLeft = Math.max(0, (user.free_generations_left || 0) - 1);
+  // Премиум или VIP — безлимит
+  if (user.is_premium || user.is_vip) return user;
+  
+  const newFreeLeft = Math.max(0, (user.free_generations_left || 0) - 1);
+  const newMonthlyLeft = Math.max(0, (user.monthly_generations_left || 0) - 1);
+  
   await pool.query(
     `UPDATE users 
      SET free_generations_left = $1, 
-         monthly_generations_left = monthly_generations_left - 1,
+         monthly_generations_left = $2, 
          total_generations = total_generations + 1 
-     WHERE id = $2`,
-    [newLeft, user.id]
+     WHERE id = $3`,
+    [newFreeLeft, newMonthlyLeft, user.id]
   );
-  user.free_generations_left = newLeft;
+  user.free_generations_left = newFreeLeft;
+  user.monthly_generations_left = newMonthlyLeft;
+  
   return user;
 }
 
+// Проверка лимита
+async function canGenerate(user) {
+  if (user.is_premium || user.is_vip) return true;
+  if (user.id === 'guest') {
+    return (user.free_generations_left || 0) > 0;
+  }
+  return (user.free_generations_left || 0) > 0;
+}
+
+// Авторизация (с загрузкой пользователя из БД)
 async function optionalAuth(req, res, next) {
   const token = req.headers.authorization?.replace('Bearer ', '');
   
@@ -160,6 +184,7 @@ async function optionalAuth(req, res, next) {
       name: 'Гость', 
       is_premium: false, 
       free_generations_left: Math.max(0, 5 - usedGenerations),
+      monthly_generations_left: Math.max(0, 5 - usedGenerations),
       generations_used: usedGenerations,
       is_vip: false,
       guestId: guestId,
@@ -190,6 +215,7 @@ async function optionalAuth(req, res, next) {
         name: 'Гость', 
         is_premium: false, 
         free_generations_left: Math.max(0, 5 - usedGenerations),
+        monthly_generations_left: Math.max(0, 5 - usedGenerations),
         generations_used: usedGenerations,
         is_vip: false,
         guestId: guestId,
@@ -206,6 +232,7 @@ async function optionalAuth(req, res, next) {
       name: 'Гость', 
       is_premium: false, 
       free_generations_left: Math.max(0, 5 - usedGenerations),
+        monthly_generations_left: Math.max(0, 5 - usedGenerations),
       generations_used: usedGenerations,
       is_vip: false,
       guestId: guestId,
@@ -215,20 +242,6 @@ async function optionalAuth(req, res, next) {
   }
 }
 
-function getStandardName(code) {
-  const standards = {
-    'common_core': 'Common Core (USA)',
-    'cambridge': 'Cambridge International',
-    'ib': 'International Baccalaureate (IB)',
-    'fgos': 'ФГОС (Россия)',
-    'national_uk': 'National Curriculum (UK)',
-    'australian': 'Australian Curriculum',
-    'cbse': 'CBSE (India)',
-    'common_eu': 'European Framework'
-  };
-  return standards[code] || code;
-}
-
 // ═══════════════════════════════════════════════════════════════
 // HEALTH CHECK
 // ═══════════════════════════════════════════════════════════════
@@ -236,7 +249,7 @@ app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     timestamp: new Date().toISOString(), 
-    version: '8.6.0', 
+    version: '8.9.0', 
     api: 'YandexGPT + Unsplash',
     db: !!pool,
     uptime: process.uptime()
@@ -252,7 +265,7 @@ app.post('/api/auth/register', async (req, res) => {
   }
 
   try {
-    const { email, password, name, referralCode } = req.body;
+    const { email, password, name } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'Email и пароль обязательны' });
     if (password.length < 6) return res.status(400).json({ error: 'Пароль минимум 6 символов' });
 
@@ -277,30 +290,6 @@ app.post('/api/auth/register', async (req, res) => {
       [user.id, tokenHash]
     );
 
-    if (referralCode) {
-      try {
-        const referrer = await pool.query('SELECT user_id FROM referrals WHERE code = $1', [referralCode.toUpperCase()]);
-        if (referrer.rows.length > 0) {
-          const referrerId = referrer.rows[0].user_id;
-          if (referrerId !== user.id) {
-            await pool.query(
-              `INSERT INTO referred_friends (referrer_id, friend_id, status, reward, created_at)
-               VALUES ($1, $2, 'activated', 2, NOW())`,
-              [referrerId, user.id]
-            );
-            await pool.query(
-              `UPDATE referrals SET referrals_count = referrals_count + 1, bonus_generations = bonus_generations + 2 WHERE user_id = $1`,
-              [referrerId]
-            );
-            await pool.query(
-              `UPDATE users SET free_generations_left = free_generations_left + 2, monthly_generations_left = monthly_generations_left + 2 WHERE id = $1`,
-              [referrerId]
-            );
-          }
-        }
-      } catch (e) { console.log('Referral error:', e); }
-    }
-
     setTimeout(() => {
       transporter.sendMail({
         from: `"Презентатор ИИ" <${FROM_EMAIL}>`,
@@ -310,7 +299,17 @@ app.post('/api/auth/register', async (req, res) => {
       }).catch(console.log);
     }, 0);
 
-    res.json({ token: sessionToken, user: { id: user.id, email: user.email, name: user.name, isPremium: false, freeGenerationsLeft: 5, monthlyGenerationsLeft: 5 } });
+    res.json({ 
+      token: sessionToken, 
+      user: { 
+        id: user.id, 
+        email: user.email, 
+        name: user.name, 
+        isPremium: false, 
+        freeGenerationsLeft: 5, 
+        monthlyGenerationsLeft: 5 
+      } 
+    });
   } catch (e) {
     console.error('Register error:', e);
     res.status(500).json({ error: 'Ошибка регистрации' });
@@ -322,7 +321,7 @@ app.post('/api/auth/register', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════
 app.post('/api/auth/login', async (req, res) => {
   if (!pool) {
-    return res.json({ token: 'demo-token', user: { id: 'demo', email: req.body.email, name: 'Demo', isPremium: true, freeGenerationsLeft: 999, monthlyGenerationsLeft: 999, isVip: true } });
+    return res.json({ token: 'demo-token', user: { id: 'demo', email: req.body.email, name: 'Demo', isPremium: true, freeGenerationsLeft: 999, monthlyGenerationsLeft: 999 } });
   }
 
   try {
@@ -342,6 +341,7 @@ app.post('/api/auth/login', async (req, res) => {
     const valid = await bcrypt.compare(password, user.password_hash);
     if (!valid) return res.status(401).json({ error: 'Неверный email или пароль' });
 
+    // Проверяем и сбрасываем месячный лимит
     user = await checkAndResetMonthlyGenerations(user);
 
     const sessionToken = crypto.randomBytes(48).toString('hex');
@@ -402,111 +402,16 @@ app.get('/api/profile', optionalAuth, async (req, res) => {
         monthlyGenerationsLeft: user.monthly_generations_left
       });
     }
-    if (!pool) {
-      return res.json({
-        id: user.id, email: user.email, name: user.name,
-        isPremium: user.is_premium || false, isVip: user.is_vip || false,
-        freeGenerationsLeft: user.free_generations_left || 5,
-        monthlyGenerationsLeft: user.monthly_generations_left || 5
-      });
-    }
-    const result = await pool.query(
-      `SELECT id, email, name, is_premium, is_vip, free_generations_left, monthly_generations_left, premium_expiry
-       FROM users WHERE id = $1`,
-      [user.id]
-    );
-    if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
-    const dbUser = result.rows[0];
     res.json({
-      id: dbUser.id, email: dbUser.email, name: dbUser.name,
-      isPremium: dbUser.is_premium || false, isVip: dbUser.is_vip || false,
-      freeGenerationsLeft: dbUser.free_generations_left || 5,
-      monthlyGenerationsLeft: dbUser.monthly_generations_left || 5,
-      premiumExpiry: dbUser.premium_expiry
+      id: user.id, email: user.email, name: user.name,
+      isPremium: user.is_premium || false, isVip: user.is_vip || false,
+      freeGenerationsLeft: user.free_generations_left || 5,
+      monthlyGenerationsLeft: user.monthly_generations_left || 5,
+      premiumExpiry: user.premium_expiry
     });
   } catch (e) {
     console.error('Profile error:', e.message);
     res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// ═══════════════════════════════════════════════════════════════
-// PROMOCODES (ТОЛЬКО CRYPTO50 И BLOGGER)
-// ═══════════════════════════════════════════════════════════════
-app.post('/api/promocode/validate', optionalAuth, async (req, res) => {
-  try {
-    const { code } = req.body;
-    const user = req.user;
-    if (!code) return res.status(400).json({ valid: false, message: 'Code required' });
-    if (!pool) return res.json({ valid: true, discountType: 'percent', discountValue: 50, description: 'DEMO: 50% off' });
-    
-    const result = await pool.query(
-      `SELECT * FROM promocodes WHERE code = $1 AND is_active = true 
-       AND (valid_until IS NULL OR valid_until > NOW())
-       AND (max_uses IS NULL OR used_count < max_uses)`,
-      [code.toUpperCase()]
-    );
-    if (result.rows.length === 0) return res.status(404).json({ valid: false, message: 'Invalid or expired promo code' });
-    
-    const promocode = result.rows[0];
-    if (user.id !== 'guest') {
-      const usageCheck = await pool.query(
-        `SELECT * FROM promocode_usages WHERE promocode_id = $1 AND user_id = $2`,
-        [promocode.id, user.id]
-      );
-      if (usageCheck.rows.length > 0) return res.status(400).json({ valid: false, message: 'You have already used this promo code' });
-    }
-    
-    res.json({ valid: true, discountType: promocode.discount_type, discountValue: promocode.discount_value, description: promocode.description, promoId: promocode.id });
-  } catch (e) {
-    console.error('Promocode validate error:', e.message);
-    res.status(500).json({ valid: false, message: 'Server error' });
-  }
-});
-
-app.post('/api/promocode/apply', optionalAuth, async (req, res) => {
-  try {
-    const { code, plan } = req.body;
-    const user = req.user;
-    if (!code || !plan) return res.status(400).json({ success: false, message: 'Code and plan required' });
-    if (!pool) {
-      const prices = { monthly: 4.99, half_year: 29.99, year: 49.99 };
-      const originalPrice = prices[plan] || 4.99;
-      return res.json({ success: true, finalPrice: originalPrice * 0.5, discountApplied: true, message: '50% off applied!' });
-    }
-    
-    const result = await pool.query(
-      `SELECT * FROM promocodes WHERE code = $1 AND is_active = true 
-       AND (valid_until IS NULL OR valid_until > NOW())
-       AND (max_uses IS NULL OR used_count < max_uses)`,
-      [code.toUpperCase()]
-    );
-    if (result.rows.length === 0) return res.status(404).json({ success: false, message: 'Invalid or expired promo code' });
-    
-    const promocode = result.rows[0];
-    if (user.id !== 'guest') {
-      const usageCheck = await pool.query(
-        `SELECT * FROM promocode_usages WHERE promocode_id = $1 AND user_id = $2`,
-        [promocode.id, user.id]
-      );
-      if (usageCheck.rows.length > 0) return res.status(400).json({ success: false, message: 'You have already used this promo code' });
-    }
-    
-    const prices = { monthly: 4.99, half_year: 29.99, year: 49.99 };
-    let originalPrice = prices[plan] || 4.99;
-    let finalPrice = originalPrice;
-    
-    if (promocode.discount_type === 'percent') {
-      finalPrice = originalPrice * (1 - promocode.discount_value / 100);
-    }
-    
-    await pool.query(`INSERT INTO promocode_usages (promocode_id, user_id) VALUES ($1, $2)`, [promocode.id, user.id]);
-    await pool.query(`UPDATE promocodes SET used_count = used_count + 1 WHERE id = $1`, [promocode.id]);
-    
-    res.json({ success: true, finalPrice: finalPrice, discountApplied: true, discountType: promocode.discount_type, discountValue: promocode.discount_value, message: `Promo code applied! You save ${promocode.discount_value}%` });
-  } catch (e) {
-    console.error('Promocode apply error:', e.message);
-    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
@@ -520,8 +425,15 @@ app.post('/api/generate', optionalAuth, async (req, res) => {
     if (!topic) return res.status(400).json({ error: 'Тема не указана' });
 
     let user = req.user;
-    if (user.free_generations_left <= 0) {
-      return res.status(402).json({ error: 'Бесплатные генерации закончились', needPayment: true });
+    
+    // Проверка лимита
+    const hasGenerations = await canGenerate(user);
+    if (!hasGenerations) {
+      return res.status(402).json({ 
+        error: 'Бесплатные генерации закончились', 
+        needPayment: true,
+        message: 'У вас закончились бесплатные генерации на этот месяц. Оформите подписку.'
+      });
     }
 
     const cacheKey = `${topic.toLowerCase()}_${slidesCount}`;
@@ -557,7 +469,15 @@ app.post('/api/generate', optionalAuth, async (req, res) => {
     if (!presentation.slides) presentation.slides = [];
     if (presentation.slides.length > slidesCount) presentation.slides = presentation.slides.slice(0, slidesCount);
     while (presentation.slides.length < slidesCount) {
-      presentation.slides.push({ title: `Слайд ${presentation.slides.length + 1}`, content: [`Ключевой аспект темы "${topic}" требует детального рассмотрения.`, `Анализ показывает важность этого направления.`, `Практические примеры подтверждают эффективность.`, `Рекомендации для внедрения.`] });
+      presentation.slides.push({ 
+        title: `Слайд ${presentation.slides.length + 1}`, 
+        content: [
+          `Ключевой аспект темы "${topic}" требует детального рассмотрения.`,
+          `Анализ показывает важность этого направления для развития.`,
+          `Практические примеры подтверждают эффективность данного подхода.`,
+          `Рекомендации для дальнейшего изучения и внедрения.`
+        ]
+      });
     }
     
     // Добавляем изображения из Unsplash
@@ -569,29 +489,42 @@ app.post('/api/generate', optionalAuth, async (req, res) => {
     
     generationCache.set(cacheKey, presentation);
     setTimeout(() => generationCache.delete(cacheKey), CACHE_TTL);
+    
     user = await decrementGenerations(user);
     
     if (pool && user.id !== 'guest') {
-      await pool.query(`INSERT INTO generation_history (user_id, type, title, slide_count, created_at) VALUES ($1, 'presentation', $2, $3, NOW())`, [user.id, topic, slidesCount]);
+      await pool.query(
+        `INSERT INTO generation_history (user_id, type, title, slide_count, created_at)
+         VALUES ($1, 'presentation', $2, $3, NOW())`,
+        [user.id, topic, slidesCount]
+      );
     }
+    
     res.json(presentation);
   } catch (e) {
     console.error('Generation error:', e.message);
-    const slides = Array(req.body.slideCount || 5).fill().map((_, i) => ({ title: i === 0 ? `Введение` : i === 4 ? 'Заключение' : `Аспект ${i+1}`, content: ['Пункт 1', 'Пункт 2', 'Пункт 3', 'Пункт 4'] }));
+    const slides = Array(req.body.slideCount || 5).fill().map((_, i) => ({ 
+      title: i === 0 ? `Введение в тему "${req.body.topic}"` : i === 4 ? 'Заключение' : `Аспект ${i+1}`, 
+      content: ['Пункт 1', 'Пункт 2', 'Пункт 3', 'Пункт 4'] 
+    }));
     res.json({ title: req.body.topic, slides });
   }
 });
 
 // ═══════════════════════════════════════════════════════════════
-// LESSON PLAN
+// LESSON PLAN GENERATE
 // ═══════════════════════════════════════════════════════════════
 app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
   try {
-    const { topic, subject, standard, grade, slideCount = 5 } = req.body;
+    const { topic, subject, grade, slideCount = 5 } = req.body;
     if (!topic || !subject || !grade) return res.status(400).json({ error: 'Тема, предмет и класс обязательны' });
     let user = req.user;
     let slidesCount = Math.min(Math.max(slideCount, 3), 10);
-    if (user.free_generations_left <= 0) return res.status(402).json({ error: 'Бесплатные генерации закончились', needPayment: true });
+    
+    const hasGenerations = await canGenerate(user);
+    if (!hasGenerations) {
+      return res.status(402).json({ error: 'Бесплатные генерации закончились', needPayment: true });
+    }
 
     const prompt = `Создай план урока по предмету "${subject}" для ${grade} класса на тему "${topic}" в виде презентации на ${slidesCount} слайдов. Верни JSON.`;
     const response = await axios.post(YANDEX_URL, {
@@ -608,7 +541,9 @@ app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
     if (!lessonData.slides) lessonData.slides = [];
     
     user = await decrementGenerations(user);
-    if (pool && user.id !== 'guest') await pool.query(`INSERT INTO generation_history (user_id, type, title, slide_count, created_at) VALUES ($1, 'lesson', $2, $3, NOW())`, [user.id, topic, slidesCount]);
+    if (pool && user.id !== 'guest') {
+      await pool.query(`INSERT INTO generation_history (user_id, type, title, slide_count, created_at) VALUES ($1, 'lesson', $2, $3, NOW())`, [user.id, topic, slidesCount]);
+    }
     res.json(lessonData);
   } catch (e) {
     console.error('Lesson error:', e.message);
@@ -625,7 +560,11 @@ app.post('/api/quiz/generate', optionalAuth, async (req, res) => {
     if (!topic) return res.status(400).json({ error: 'Тема не указана' });
     let user = req.user;
     const qCount = Math.min(Math.max(questionCount, 3), 10);
-    if (user.free_generations_left <= 0) return res.status(402).json({ error: 'Бесплатные генерации закончились', needPayment: true });
+    
+    const hasGenerations = await canGenerate(user);
+    if (!hasGenerations) {
+      return res.status(402).json({ error: 'Бесплатные генерации закончились', needPayment: true });
+    }
 
     const prompt = `Создай тест из ${qCount} вопросов по теме "${topic}". 4 варианта ответа. Верни JSON.`;
     const response = await axios.post(YANDEX_URL, {
@@ -641,7 +580,9 @@ app.post('/api/quiz/generate', optionalAuth, async (req, res) => {
     let quizData = JSON.parse(cleanText);
     
     user = await decrementGenerations(user);
-    if (pool && user.id !== 'guest') await pool.query(`INSERT INTO generation_history (user_id, type, title, slide_count, created_at) VALUES ($1, 'quiz', $2, $3, NOW())`, [user.id, topic, qCount]);
+    if (pool && user.id !== 'guest') {
+      await pool.query(`INSERT INTO generation_history (user_id, type, title, slide_count, created_at) VALUES ($1, 'quiz', $2, $3, NOW())`, [user.id, topic, qCount]);
+    }
     res.json(quizData);
   } catch (e) {
     console.error('Quiz error:', e.message);
@@ -655,7 +596,11 @@ app.post('/api/quiz/from-presentation', optionalAuth, async (req, res) => {
     if (!title || !slides) return res.status(400).json({ error: 'Некорректные данные' });
     let user = req.user;
     const qCount = Math.min(Math.max(questionCount, 3), 10);
-    if (user.free_generations_left <= 0) return res.status(402).json({ error: 'Бесплатные генерации закончились', needPayment: true });
+    
+    const hasGenerations = await canGenerate(user);
+    if (!hasGenerations) {
+      return res.status(402).json({ error: 'Бесплатные генерации закончились', needPayment: true });
+    }
 
     const slidesText = slides.map(s => typeof s === 'string' ? s : (s.content?.join(' ') || s.title || '')).join('\n').substring(0, 3000);
     const prompt = `На основе презентации "${title}" создай тест из ${qCount} вопросов. Верни JSON.`;
@@ -672,7 +617,9 @@ app.post('/api/quiz/from-presentation', optionalAuth, async (req, res) => {
     let quizData = JSON.parse(cleanText);
     
     user = await decrementGenerations(user);
-    if (pool && user.id !== 'guest') await pool.query(`INSERT INTO generation_history (user_id, type, title, slide_count, created_at) VALUES ($1, 'quiz', $2, $3, NOW())`, [user.id, title, qCount]);
+    if (pool && user.id !== 'guest') {
+      await pool.query(`INSERT INTO generation_history (user_id, type, title, slide_count, created_at) VALUES ($1, 'quiz', $2, $3, NOW())`, [user.id, title, qCount]);
+    }
     res.json(quizData);
   } catch (e) {
     console.error('Quiz from presentation error:', e.message);
@@ -689,7 +636,11 @@ app.post('/api/report/generate', optionalAuth, async (req, res) => {
     if (!company || !period) return res.status(400).json({ error: 'Компания и период обязательны' });
     let user = req.user;
     let slidesCount = Math.min(Math.max(slideCount, 3), 15);
-    if (user.free_generations_left <= 0) return res.status(402).json({ error: 'Бесплатные генерации закончились', needPayment: true });
+    
+    const hasGenerations = await canGenerate(user);
+    if (!hasGenerations) {
+      return res.status(402).json({ error: 'Бесплатные генерации закончились', needPayment: true });
+    }
 
     const prompt = `Создай ${reportType || 'финансовый'} отчёт для компании "${company}" за период "${period}" по стандарту ${standard || 'IFRS'}. ${slidesCount} слайдов. Верни JSON.`;
     const response = await axios.post(YANDEX_URL, {
@@ -705,7 +656,9 @@ app.post('/api/report/generate', optionalAuth, async (req, res) => {
     let reportData = JSON.parse(cleanText);
     
     user = await decrementGenerations(user);
-    if (pool && user.id !== 'guest') await pool.query(`INSERT INTO generation_history (user_id, type, title, slide_count, created_at) VALUES ($1, 'report', $2, $3, NOW())`, [user.id, company, slidesCount]);
+    if (pool && user.id !== 'guest') {
+      await pool.query(`INSERT INTO generation_history (user_id, type, title, slide_count, created_at) VALUES ($1, 'report', $2, $3, NOW())`, [user.id, company, slidesCount]);
+    }
     res.json(reportData);
   } catch (e) {
     console.error('Report error:', e.message);
@@ -775,11 +728,99 @@ app.post('/api/payment/callback', async (req, res) => {
       if (userResult.rows.length > 0) userId = userResult.rows[0].id;
     }
     if (userId) {
-      await pool.query(`UPDATE users SET is_premium = TRUE, premium_expiry = $1, free_generations_left = 9999, monthly_generations_left = 9999 WHERE id = $2`, [expiry, userId]);
+      await pool.query(
+        `UPDATE users SET is_premium = TRUE, premium_expiry = $1, free_generations_left = 9999, monthly_generations_left = 9999 WHERE id = $2`,
+        [expiry, userId]
+      );
       console.log(`✅ Premium activated for ${userId} until ${expiry}`);
     }
     res.json({ success: true });
-  } catch (e) { console.error('Payment callback error:', e.message); res.status(500).json({ error: 'Error processing payment' }); }
+  } catch (e) { 
+    console.error('Payment callback error:', e.message); 
+    res.status(500).json({ error: 'Error processing payment' }); 
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// PROMOCODES
+// ═══════════════════════════════════════════════════════════════
+app.post('/api/promocode/validate', optionalAuth, async (req, res) => {
+  try {
+    const { code } = req.body;
+    if (!code) return res.status(400).json({ valid: false, message: 'Code required' });
+    
+    if (!pool) {
+      return res.json({ valid: true, discountType: 'percent', discountValue: 50, description: 'DEMO: 50% off' });
+    }
+    
+    const result = await pool.query(
+      `SELECT * FROM promocodes WHERE code = $1 AND is_active = true 
+       AND (valid_until IS NULL OR valid_until > NOW())
+       AND (max_uses IS NULL OR used_count < max_uses)`,
+      [code.toUpperCase()]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ valid: false, message: 'Invalid or expired promo code' });
+    }
+    
+    const promocode = result.rows[0];
+    res.json({ 
+      valid: true, 
+      discountType: promocode.discount_type, 
+      discountValue: promocode.discount_value, 
+      description: promocode.description 
+    });
+  } catch (e) {
+    console.error('Promocode validate error:', e.message);
+    res.status(500).json({ valid: false, message: 'Server error' });
+  }
+});
+
+app.post('/api/promocode/apply', optionalAuth, async (req, res) => {
+  try {
+    const { code, plan } = req.body;
+    const user = req.user;
+    if (!code || !plan) return res.status(400).json({ success: false, message: 'Code and plan required' });
+    
+    if (!pool) {
+      const prices = { monthly: 4.99, half_year: 29.99, year: 49.99 };
+      const originalPrice = prices[plan] || 4.99;
+      return res.json({ success: true, finalPrice: originalPrice * 0.5, discountApplied: true, message: '50% off applied!' });
+    }
+    
+    const result = await pool.query(
+      `SELECT * FROM promocodes WHERE code = $1 AND is_active = true 
+       AND (valid_until IS NULL OR valid_until > NOW())
+       AND (max_uses IS NULL OR used_count < max_uses)`,
+      [code.toUpperCase()]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Invalid or expired promo code' });
+    }
+    
+    const promocode = result.rows[0];
+    const prices = { monthly: 4.99, half_year: 29.99, year: 49.99 };
+    const originalPrice = prices[plan] || 4.99;
+    let finalPrice = originalPrice;
+    
+    if (promocode.discount_type === 'percent') {
+      finalPrice = originalPrice * (1 - promocode.discount_value / 100);
+    }
+    
+    res.json({ 
+      success: true, 
+      finalPrice: finalPrice, 
+      discountApplied: true, 
+      discountType: promocode.discount_type,
+      discountValue: promocode.discount_value,
+      message: `Promo code applied! You save ${promocode.discount_value}%` 
+    });
+  } catch (e) {
+    console.error('Promocode apply error:', e.message);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════
@@ -790,43 +831,34 @@ async function initDatabase() {
   try {
     await pool.query(`
       CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+      
       CREATE TABLE IF NOT EXISTS users (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
         email VARCHAR(255) UNIQUE NOT NULL,
         password_hash VARCHAR(255),
         name VARCHAR(255),
-        country VARCHAR(10),
         is_premium BOOLEAN DEFAULT FALSE,
         premium_expiry TIMESTAMPTZ,
         free_generations_left INTEGER DEFAULT 5,
         monthly_generations_left INTEGER DEFAULT 5,
-        last_reset_date TIMESTAMPTZ DEFAULT NOW(),
         total_generations INTEGER DEFAULT 0,
-        surprise_uses_left INTEGER DEFAULT 3,
-        email_verified BOOLEAN DEFAULT FALSE,
-        verification_token VARCHAR(255),
-        last_login TIMESTAMPTZ,
-        failed_login_attempts INTEGER DEFAULT 0,
-        locked_until TIMESTAMPTZ,
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        updated_at TIMESTAMPTZ DEFAULT NOW(),
-        social_id VARCHAR(255) UNIQUE,
-        social_provider VARCHAR(50),
-        avatar_url TEXT,
+        last_reset_date TIMESTAMPTZ DEFAULT NOW(),
         is_vip BOOLEAN DEFAULT FALSE,
-        vip_activated_at TIMESTAMPTZ
+        vip_activated_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW()
       );
+      
       CREATE TABLE IF NOT EXISTS sessions (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
         user_id UUID REFERENCES users(id) ON DELETE CASCADE,
         token_hash VARCHAR(255) UNIQUE NOT NULL,
-        ip_address VARCHAR(45),
-        user_agent TEXT,
         expires_at TIMESTAMPTZ NOT NULL,
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
+      
       CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token_hash);
       CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+      
       CREATE TABLE IF NOT EXISTS generation_history (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
         user_id UUID REFERENCES users(id) ON DELETE CASCADE,
@@ -835,6 +867,7 @@ async function initDatabase() {
         slide_count INTEGER,
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
+      
       CREATE TABLE IF NOT EXISTS promocodes (
         id SERIAL PRIMARY KEY,
         code VARCHAR(50) UNIQUE NOT NULL,
@@ -848,29 +881,16 @@ async function initDatabase() {
         is_active BOOLEAN DEFAULT TRUE,
         created_at TIMESTAMP DEFAULT NOW()
       );
+      
       CREATE TABLE IF NOT EXISTS promocode_usages (
         id SERIAL PRIMARY KEY,
         promocode_id INT REFERENCES promocodes(id),
         user_id UUID REFERENCES users(id) ON DELETE CASCADE,
         used_at TIMESTAMP DEFAULT NOW()
       );
-      CREATE TABLE IF NOT EXISTS user_subscriptions (
-        id SERIAL PRIMARY KEY,
-        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-        plan VARCHAR(50) NOT NULL,
-        amount DECIMAL(10,2),
-        expires_at TIMESTAMPTZ NOT NULL,
-        created_at TIMESTAMPTZ DEFAULT NOW()
-      );
-      CREATE TABLE IF NOT EXISTS promocode_analytics (
-        id SERIAL PRIMARY KEY,
-        promocode_id INTEGER REFERENCES promocodes(id),
-        action VARCHAR(50),
-        user_id UUID REFERENCES users(id),
-        created_at TIMESTAMPTZ DEFAULT NOW()
-      );
     `);
     console.log('✅ Tables created');
+    
     await pool.query(`
       INSERT INTO promocodes (code, discount_type, discount_value, description, max_uses) VALUES
       ('CRYPTO50', 'percent', 50, '50% off first month', 20),
@@ -878,17 +898,16 @@ async function initDatabase() {
       ON CONFLICT (code) DO NOTHING
     `);
     console.log('✅ Promocodes inserted');
-  } catch (e) { console.error('Database init error:', e.message); }
+  } catch (e) { 
+    console.error('Database init error:', e.message); 
+  }
 }
-
-setInterval(() => { try { axios.get(`http://localhost:${PORT}/api/health`, { timeout: 5000 }); } catch(e) {} }, 300000);
 
 initDatabase().then(() => {
   app.listen(PORT, () => {
     console.log(`🚀 Server on port ${PORT}`);
     console.log(`📊 DB: ${pool ? 'connected' : 'DEMO mode'}`);
     console.log(`🎨 Unsplash: ${UNSPLASH_ACCESS_KEY ? 'enabled' : 'disabled'}`);
-    console.log(`💰 Postback: /api/payment/callback`);
     console.log(`🎟️ Promocodes: CRYPTO50 (50%), BLOGGER (30%)`);
   });
 });
