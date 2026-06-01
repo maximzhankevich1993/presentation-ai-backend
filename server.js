@@ -56,6 +56,41 @@ const YANDEX_FOLDER_ID = process.env.YANDEX_FOLDER_ID;
 const YANDEX_URL = 'https://llm.api.cloud.yandex.net/foundationModels/v1/completion';
 
 // ═══════════════════════════════════════════════════════════════
+// UNSPLASH IMAGES
+// ═══════════════════════════════════════════════════════════════
+const UNSPLASH_ACCESS_KEY = process.env.UNSPLASH_ACCESS_KEY;
+
+async function getImageUrl(query) {
+  if (!UNSPLASH_ACCESS_KEY) {
+    console.log('⚠️ UNSPLASH_ACCESS_KEY not set, skipping images');
+    return null;
+  }
+  
+  try {
+    const response = await axios.get('https://api.unsplash.com/photos/random', {
+      params: {
+        query: query,
+        orientation: 'landscape',
+        per_page: 1
+      },
+      headers: {
+        Authorization: `Client-ID ${UNSPLASH_ACCESS_KEY}`
+      },
+      timeout: 5000
+    });
+    
+    if (response.data && response.data.urls && response.data.urls.regular) {
+      console.log(`🖼️ Image found for: ${query}`);
+      return response.data.urls.regular;
+    }
+    return null;
+  } catch (error) {
+    console.log(`❌ Unsplash error for "${query}": ${error.message}`);
+    return null;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
 // EMAIL
 // ═══════════════════════════════════════════════════════════
 const transporter = nodemailer.createTransport({
@@ -267,8 +302,8 @@ app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     timestamp: new Date().toISOString(), 
-    version: '8.4.0', 
-    api: 'YandexGPT',
+    version: '8.5.0', 
+    api: 'YandexGPT + Unsplash',
     db: !!pool,
     uptime: process.uptime()
   });
@@ -698,7 +733,7 @@ app.post('/api/promocode/apply', optionalAuth, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// GENERATE (ПРЕЗЕНТАЦИИ)
+// GENERATE (ПРЕЗЕНТАЦИИ) С UNSPLASH
 // ═══════════════════════════════════════════════════════════════
 app.post('/api/generate', optionalAuth, async (req, res) => {
   try {
@@ -788,6 +823,25 @@ app.post('/api/generate', optionalAuth, async (req, res) => {
         ]
       });
     }
+    
+    // ═══════════════════════════════════════════════════════════
+    // ДОБАВЛЯЕМ ИЗОБРАЖЕНИЯ ЧЕРЕЗ UNSPLASH
+    // ═══════════════════════════════════════════════════════════
+    console.log(`🖼️ Добавляем изображения для ${presentation.slides.length} слайдов...`);
+    
+    for (let i = 0; i < presentation.slides.length; i++) {
+      const slide = presentation.slides[i];
+      const imageQuery = `${topic} ${slide.title}`.substring(0, 50);
+      const imageUrl = await getImageUrl(imageQuery);
+      presentation.slides[i].imageUrl = imageUrl;
+      
+      if (i < presentation.slides.length - 1) {
+        await new Promise(resolve => setTimeout(resolve, 300));
+      }
+    }
+    
+    const imagesCount = presentation.slides.filter(s => s.imageUrl).length;
+    console.log(`✅ Добавлено ${imagesCount}/${presentation.slides.length} изображений`);
     
     generationCache.set(cacheKey, presentation);
     setTimeout(() => generationCache.delete(cacheKey), CACHE_TTL);
@@ -1400,7 +1454,6 @@ app.post('/api/payment/callback', async (req, res) => {
       promo_code 
     } = req.body;
     
-    // Проверяем, что платёж успешен
     if (status !== 'success' && status !== 'completed') {
       console.log(`⚠️ Payment not successful: ${status}`);
       return res.json({ success: true });
@@ -1411,7 +1464,6 @@ app.post('/api/payment/callback', async (req, res) => {
       return res.json({ success: true });
     }
     
-    // Определяем срок подписки
     let durationMonths = 1;
     let planName = 'monthly';
     if (plan === 'Полгода' || plan === 'half_year' || plan === 'half') {
@@ -1425,7 +1477,6 @@ app.post('/api/payment/callback', async (req, res) => {
     const expiry = new Date();
     expiry.setMonth(expiry.getMonth() + durationMonths);
     
-    // Ищем пользователя по email
     let userId = null;
     let userEmail = null;
     
@@ -1441,7 +1492,6 @@ app.post('/api/payment/callback', async (req, res) => {
     }
     
     if (userId) {
-      // Активируем Premium
       await pool.query(
         `UPDATE users 
          SET is_premium = TRUE, 
@@ -1454,14 +1504,12 @@ app.post('/api/payment/callback', async (req, res) => {
       
       console.log(`✅ Premium activated for user ${userId} until ${expiry}`);
       
-      // Сохраняем информацию о подписке
       await pool.query(
         `INSERT INTO user_subscriptions (user_id, plan, amount, expires_at, created_at)
          VALUES ($1, $2, $3, $4, NOW())`,
         [userId, planName, amount, expiry]
       );
       
-      // Проверяем, есть ли бонусный месяц (CRYPTO10)
       const bonusResult = await pool.query(
         `SELECT * FROM user_bonus_months 
          WHERE user_id = $1 AND is_used = FALSE AND bonus_month = 2`,
@@ -1484,7 +1532,6 @@ app.post('/api/payment/callback', async (req, res) => {
         console.log(`🎁 Bonus second month applied for user ${userId}`);
       }
       
-      // Отправляем email-уведомление
       if (userEmail) {
         try {
           const expiryDate = expiry.toLocaleDateString('ru-RU');
@@ -1498,15 +1545,8 @@ app.post('/api/payment/callback', async (req, res) => {
                 <p>Ваша Premium-подписка активирована.</p>
                 <p><strong>План:</strong> ${planName === 'monthly' ? 'Месячный' : planName === 'half_year' ? '6 месяцев' : 'Годовой'}</p>
                 <p><strong>Действует до:</strong> ${expiryDate}</p>
-                <p>Теперь у вас безлимитный доступ ко всем функциям:</p>
-                <ul>
-                  <li>✅ Безлимит презентаций</li>
-                  <li>✅ До 50 слайдов</li>
-                  <li>✅ Экспорт в PDF без водяного знака</li>
-                  <li>✅ Загрузка своих картинок и логотипов</li>
-                </ul>
+                <p>Теперь у вас безлимитный доступ ко всем функциям.</p>
                 <a href="https://app.prezentator-ai.com" style="display: inline-block; background: #1DB954; color: #000; padding: 12px 24px; text-decoration: none; border-radius: 8px; margin-top: 16px; font-weight: bold;">Перейти в приложение</a>
-                <p style="margin-top: 24px; font-size: 12px; color: #666;">Если у вас есть вопросы, ответьте на это письмо или напишите в поддержку.</p>
               </div>
             `
           });
@@ -1516,7 +1556,6 @@ app.post('/api/payment/callback', async (req, res) => {
         }
       }
       
-      // Записываем аналитику
       await pool.query(
         `INSERT INTO promocode_analytics (promocode_id, action, user_id, created_at)
          VALUES ($1, 'payment_success', $2, NOW())`,
@@ -1643,7 +1682,6 @@ async function initDatabase() {
     `);
     console.log('✅ Tables created');
     
-    // Вставка промокодов
     await pool.query(`
       INSERT INTO promocodes (code, discount_type, discount_value, description, max_uses) VALUES
       ('CRYPTO10', 'free_month', NULL, 'Second month free for first 10 paying users', 10),
@@ -1668,6 +1706,7 @@ initDatabase().then(() => {
   app.listen(PORT, () => {
     console.log(`🚀 Server on port ${PORT}`);
     console.log(`📊 DB: ${pool ? 'connected' : 'DEMO mode'}`);
+    console.log(`🎨 Unsplash: ${UNSPLASH_ACCESS_KEY ? 'enabled' : 'disabled'}`);
     console.log(`💰 Postback URL: /api/payment/callback`);
     console.log(`🎟️ Promocodes: CRYPTO10, CRYPTO50, BLOGGER`);
   });
