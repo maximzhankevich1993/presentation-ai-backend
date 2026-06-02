@@ -243,7 +243,7 @@ app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     timestamp: new Date().toISOString(), 
-    version: '9.1.0', 
+    version: '9.2.0', 
     api: 'YandexGPT + Unsplash',
     db: !!pool,
     uptime: process.uptime()
@@ -892,6 +892,88 @@ app.post('/api/promocode/apply', optionalAuth, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
+// VIP STATS
+// ═══════════════════════════════════════════════════════════════
+app.get('/api/vip/stats', async (req, res) => {
+  try {
+    if (!pool) {
+      return res.json({ totalSpots: 50, occupiedSpots: 0 });
+    }
+    
+    const result = await pool.query(
+      'SELECT COUNT(*) as occupied FROM users WHERE is_vip = TRUE'
+    );
+    
+    const occupiedSpots = parseInt(result.rows[0]?.occupied || 0);
+    const totalSpots = 50;
+    
+    res.json({ totalSpots, occupiedSpots });
+  } catch (e) {
+    console.error('VIP stats error:', e.message);
+    res.status(500).json({ error: 'Failed to load VIP stats' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// ACTIVATE VIP
+// ═══════════════════════════════════════════════════════════════
+app.post('/api/vip/activate', optionalAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    
+    if (user.id === 'guest') {
+      return res.status(401).json({ error: 'Please log in first' });
+    }
+    
+    if (!pool) {
+      return res.json({ success: true, message: 'VIP activated (demo)' });
+    }
+    
+    // Проверяем, сколько уже занято VIP-мест
+    const countResult = await pool.query(
+      'SELECT COUNT(*) as occupied FROM users WHERE is_vip = TRUE'
+    );
+    const occupiedSpots = parseInt(countResult.rows[0]?.occupied || 0);
+    
+    if (occupiedSpots >= 50) {
+      return res.status(400).json({ error: 'All VIP spots are taken' });
+    }
+    
+    // Проверяем, не является ли пользователь уже VIP
+    if (user.is_vip) {
+      return res.status(400).json({ error: 'You are already a VIP member' });
+    }
+    
+    // Активируем VIP
+    const expiry = new Date();
+    expiry.setFullYear(expiry.getFullYear() + 10); // на 10 лет
+    
+    await pool.query(
+      `UPDATE users 
+       SET is_vip = TRUE, 
+           vip_activated_at = NOW(),
+           premium_expiry = $1,
+           free_generations_left = 9999,
+           monthly_generations_left = 9999
+       WHERE id = $2`,
+      [expiry, user.id]
+    );
+    
+    console.log(`👑 VIP activated for user ${user.id} (spot ${occupiedSpots + 1}/50)`);
+    
+    res.json({ 
+      success: true, 
+      message: 'VIP activated! You now have lifetime access.',
+      spot: occupiedSpots + 1,
+      totalSpots: 50
+    });
+  } catch (e) {
+    console.error('VIP activation error:', e.message);
+    res.status(500).json({ error: 'Failed to activate VIP' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
 // INIT DATABASE
 // ═══════════════════════════════════════════════════════════════
 async function initDatabase() {
@@ -977,5 +1059,6 @@ initDatabase().then(() => {
     console.log(`📊 DB: ${pool ? 'connected' : 'DEMO mode'}`);
     console.log(`🎨 Unsplash: ${UNSPLASH_ACCESS_KEY ? 'enabled' : 'disabled'}`);
     console.log(`🎟️ Promocodes: CRYPTO50 (50%), BLOGGER (30%)`);
+    console.log(`👑 VIP endpoints: /api/vip/stats, /api/vip/activate`);
   });
 });
