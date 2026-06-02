@@ -97,7 +97,6 @@ if (!YANDEX_API_KEY || !YANDEX_FOLDER_ID) {
 // ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 // ═══════════════════════════════════════════════════════════════
 
-// Сброс месячного лимита (если новый месяц)
 async function checkAndResetMonthlyGenerations(user) {
   if (!pool || user.id === 'guest') return user;
   if (user.is_premium || user.is_vip) return user;
@@ -129,9 +128,7 @@ async function checkAndResetMonthlyGenerations(user) {
   return user;
 }
 
-// Уменьшаем счётчик генераций
 async function decrementGenerations(user) {
-  // Гость — локальный счётчик
   if (user.id === 'guest') {
     const newCount = (user.generations_used || 0) + 1;
     guestGenerationCounter.set(user.guestId, newCount);
@@ -142,7 +139,6 @@ async function decrementGenerations(user) {
   
   if (!pool) return user;
   
-  // Премиум или VIP — безлимит
   if (user.is_premium || user.is_vip) return user;
   
   const newFreeLeft = Math.max(0, (user.free_generations_left || 0) - 1);
@@ -162,7 +158,6 @@ async function decrementGenerations(user) {
   return user;
 }
 
-// Проверка лимита
 async function canGenerate(user) {
   if (user.is_premium || user.is_vip) return true;
   if (user.id === 'guest') {
@@ -171,7 +166,6 @@ async function canGenerate(user) {
   return (user.free_generations_left || 0) > 0;
 }
 
-// Авторизация (с загрузкой пользователя из БД)
 async function optionalAuth(req, res, next) {
   const token = req.headers.authorization?.replace('Bearer ', '');
   
@@ -232,7 +226,7 @@ async function optionalAuth(req, res, next) {
       name: 'Гость', 
       is_premium: false, 
       free_generations_left: Math.max(0, 5 - usedGenerations),
-        monthly_generations_left: Math.max(0, 5 - usedGenerations),
+      monthly_generations_left: Math.max(0, 5 - usedGenerations),
       generations_used: usedGenerations,
       is_vip: false,
       guestId: guestId,
@@ -249,7 +243,7 @@ app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     timestamp: new Date().toISOString(), 
-    version: '8.9.0', 
+    version: '9.1.0', 
     api: 'YandexGPT + Unsplash',
     db: !!pool,
     uptime: process.uptime()
@@ -341,7 +335,6 @@ app.post('/api/auth/login', async (req, res) => {
     const valid = await bcrypt.compare(password, user.password_hash);
     if (!valid) return res.status(401).json({ error: 'Неверный email или пароль' });
 
-    // Проверяем и сбрасываем месячный лимит
     user = await checkAndResetMonthlyGenerations(user);
 
     const sessionToken = crypto.randomBytes(48).toString('hex');
@@ -416,7 +409,7 @@ app.get('/api/profile', optionalAuth, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// GENERATE С UNSPLASH
+// GENERATE ПРЕЗЕНТАЦИИ (С UNSPLASH)
 // ═══════════════════════════════════════════════════════════════
 app.post('/api/generate', optionalAuth, async (req, res) => {
   try {
@@ -426,7 +419,6 @@ app.post('/api/generate', optionalAuth, async (req, res) => {
 
     let user = req.user;
     
-    // Проверка лимита
     const hasGenerations = await canGenerate(user);
     if (!hasGenerations) {
       return res.status(402).json({ 
@@ -480,7 +472,6 @@ app.post('/api/generate', optionalAuth, async (req, res) => {
       });
     }
     
-    // Добавляем изображения из Unsplash
     for (let i = 0; i < presentation.slides.length; i++) {
       const imageUrl = await getImageUrl(`${topic} ${presentation.slides[i].title}`);
       presentation.slides[i].imageUrl = imageUrl;
@@ -512,7 +503,7 @@ app.post('/api/generate', optionalAuth, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// LESSON PLAN GENERATE
+// LESSON PLAN GENERATE (ИСПРАВЛЕННЫЙ)
 // ═══════════════════════════════════════════════════════════════
 app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
   try {
@@ -526,7 +517,23 @@ app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
       return res.status(402).json({ error: 'Бесплатные генерации закончились', needPayment: true });
     }
 
-    const prompt = `Создай план урока по предмету "${subject}" для ${grade} класса на тему "${topic}" в виде презентации на ${slidesCount} слайдов. Верни JSON.`;
+    const prompt = `Ты — опытный учитель. Создай план урока по предмету "${subject}" для ${grade} класса на тему "${topic}" в виде презентации на ${slidesCount} слайдов.
+
+Верни ТОЛЬКО JSON в формате:
+{
+  "topic": "${topic}",
+  "subject": "${subject}",
+  "grade": "${grade}",
+  "slides": [
+    {
+      "title": "Заголовок слайда",
+      "content": ["Пункт 1", "Пункт 2", "Пункт 3", "Пункт 4"]
+    }
+  ],
+  "homework": "Домашнее задание",
+  "materials": ["Материал 1", "Материал 2"]
+}`;
+
     const response = await axios.post(YANDEX_URL, {
       modelUri: `gpt://${YANDEX_FOLDER_ID}/yandexgpt/latest`,
       completionOptions: { stream: false, temperature: 0.7, maxTokens: "8000" },
@@ -538,7 +545,29 @@ app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
     const jsonMatch = cleanText.match(/\{[\s\S]*\}/);
     if (jsonMatch) cleanText = jsonMatch[0];
     let lessonData = JSON.parse(cleanText);
+    
     if (!lessonData.slides) lessonData.slides = [];
+    
+    // ИСПРАВЛЕНИЕ: ПРЕВРАЩАЕМ STRING В ARRAY
+    lessonData.slides = lessonData.slides.map(slide => {
+      if (typeof slide.content === 'string') {
+        slide.content = [slide.content];
+      }
+      if (!Array.isArray(slide.content)) {
+        slide.content = [slide.content?.toString() || 'Информация'];
+      }
+      while (slide.content.length < 4) {
+        slide.content.push('Дополнительный материал');
+      }
+      return slide;
+    });
+    
+    while (lessonData.slides.length < slidesCount) {
+      lessonData.slides.push({
+        title: `Слайд ${lessonData.slides.length + 1}`,
+        content: ['Информация', 'Пример', 'Задание', 'Вывод']
+      });
+    }
     
     user = await decrementGenerations(user);
     if (pool && user.id !== 'guest') {
@@ -566,7 +595,7 @@ app.post('/api/quiz/generate', optionalAuth, async (req, res) => {
       return res.status(402).json({ error: 'Бесплатные генерации закончились', needPayment: true });
     }
 
-    const prompt = `Создай тест из ${qCount} вопросов по теме "${topic}". 4 варианта ответа. Верни JSON.`;
+    const prompt = `Ты — опытный преподаватель. Создай тест из ${qCount} вопросов по теме "${topic}". 4 варианта ответа. Верни JSON.`;
     const response = await axios.post(YANDEX_URL, {
       modelUri: `gpt://${YANDEX_FOLDER_ID}/yandexgpt/latest`,
       completionOptions: { stream: false, temperature: 0.7, maxTokens: "4000" },
@@ -628,7 +657,7 @@ app.post('/api/quiz/from-presentation', optionalAuth, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// REPORT GENERATE
+// REPORT GENERATE (ИСПРАВЛЕННЫЙ)
 // ═══════════════════════════════════════════════════════════════
 app.post('/api/report/generate', optionalAuth, async (req, res) => {
   try {
@@ -642,7 +671,23 @@ app.post('/api/report/generate', optionalAuth, async (req, res) => {
       return res.status(402).json({ error: 'Бесплатные генерации закончились', needPayment: true });
     }
 
-    const prompt = `Создай ${reportType || 'финансовый'} отчёт для компании "${company}" за период "${period}" по стандарту ${standard || 'IFRS'}. ${slidesCount} слайдов. Верни JSON.`;
+    const prompt = `Ты — профессиональный финансовый аналитик. Создай ${reportType || 'финансовый'} отчёт для компании "${company}" за период "${period}" по стандарту ${standard || 'IFRS'}. ${slidesCount} слайдов.
+
+Верни ТОЛЬКО JSON в формате:
+{
+  "title": "${reportType || 'Финансовый отчёт'}: ${company}",
+  "company": "${company}",
+  "period": "${period}",
+  "standard": "${standard || 'IFRS'}",
+  "reportType": "${reportType || 'Финансовый отчёт'}",
+  "slides": [
+    {
+      "title": "Заголовок слайда",
+      "content": ["Пункт 1 с цифрами", "Пункт 2 с аналитикой", "Пункт 3 с выводом", "Пункт 4 с рекомендацией"]
+    }
+  ]
+}`;
+
     const response = await axios.post(YANDEX_URL, {
       modelUri: `gpt://${YANDEX_FOLDER_ID}/yandexgpt/latest`,
       completionOptions: { stream: false, temperature: 0.7, maxTokens: "8000" },
@@ -654,6 +699,29 @@ app.post('/api/report/generate', optionalAuth, async (req, res) => {
     const jsonMatch = cleanText.match(/\{[\s\S]*\}/);
     if (jsonMatch) cleanText = jsonMatch[0];
     let reportData = JSON.parse(cleanText);
+    
+    if (!reportData.slides) reportData.slides = [];
+    
+    // ИСПРАВЛЕНИЕ: ПРЕВРАЩАЕМ STRING В ARRAY
+    reportData.slides = reportData.slides.map(slide => {
+      if (typeof slide.content === 'string') {
+        slide.content = [slide.content];
+      }
+      if (!Array.isArray(slide.content)) {
+        slide.content = [slide.content?.toString() || 'Информация'];
+      }
+      while (slide.content.length < 4) {
+        slide.content.push('Дополнительный анализ');
+      }
+      return slide;
+    });
+    
+    while (reportData.slides.length < slidesCount) {
+      reportData.slides.push({
+        title: `Раздел ${reportData.slides.length + 1}`,
+        content: ['Показатель', 'Анализ', 'Вывод', 'Рекомендация']
+      });
+    }
     
     user = await decrementGenerations(user);
     if (pool && user.id !== 'guest') {
