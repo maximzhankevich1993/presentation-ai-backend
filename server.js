@@ -88,7 +88,6 @@ const transporter = nodemailer.createTransport({
 });
 const FROM_EMAIL = process.env.FROM_EMAIL || 'noreply@presentation-ai.com';
 
-// ✅ ПРОВЕРКА КЛЮЧЕЙ ОСТАЁТСЯ!
 if (!YANDEX_API_KEY || !YANDEX_FOLDER_ID) {
   console.error('❌ YANDEX_API_KEY и YANDEX_FOLDER_ID обязательны');
   process.exit(1);
@@ -639,6 +638,7 @@ app.post('/api/quiz/from-presentation', optionalAuth, async (req, res) => {
       return res.status(402).json({ error: 'Бесплатные генерации закончились', needPayment: true });
     }
 
+    const slidesText = slides.map(s => typeof s === 'string' ? s : (s.content?.join(' ') || s.title || '')).join('\n').substring(0, 3000);
     const prompt = `На основе презентации "${title}" создай тест из ${qCount} вопросов. Верни JSON.`;
     const response = await axios.post(YANDEX_URL, {
       modelUri: `gpt://${YANDEX_FOLDER_ID}/yandexgpt/latest`,
@@ -985,9 +985,11 @@ async function initDatabase() {
     return;
   }
   try {
+    // Проверяем подключение
     await pool.query('SELECT 1');
     console.log('✅ База данных подключена');
     
+    // Создаём таблицы
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1039,7 +1041,7 @@ async function initDatabase() {
         created_at TIMESTAMP DEFAULT NOW()
       );
     `);
-    console.log('✅ Tables created');
+    console.log('✅ Таблицы созданы/проверены');
     
     await pool.query(`
       INSERT INTO promocodes (code, discount_type, discount_value, description, max_uses) VALUES
@@ -1047,9 +1049,10 @@ async function initDatabase() {
       ('BLOGGER', 'percent', 30, '30% off first month', 50)
       ON CONFLICT (code) DO NOTHING
     `);
-    console.log('✅ Promocodes inserted');
+    console.log('✅ Промокоды добавлены');
   } catch (e) { 
-    console.error('❌ Database init error:', e.message); 
+    console.error('❌ Ошибка при инициализации БД:', e.message);
+    console.error('❌ Детали:', e);
   }
 }
 
