@@ -23,15 +23,15 @@ app.use(cors({
 }));
 
 // ═══════════════════════════════════════════════════════════════
-// DATABASE
+// DATABASE (FIXED FOR SUPABASE)
 // ═══════════════════════════════════════════════════════════════
 const pool = process.env.DATABASE_URL 
   ? new Pool({ 
       connectionString: process.env.DATABASE_URL, 
       ssl: { rejectUnauthorized: false },
-      max: 20,
+      max: 10,
       idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: 10000,
+      connectionTimeoutMillis: 30000,
     })
   : null;
 
@@ -88,6 +88,7 @@ const transporter = nodemailer.createTransport({
 });
 const FROM_EMAIL = process.env.FROM_EMAIL || 'noreply@presentation-ai.com';
 
+// ✅ ПРОВЕРКА КЛЮЧЕЙ ОСТАЁТСЯ!
 if (!YANDEX_API_KEY || !YANDEX_FOLDER_ID) {
   console.error('❌ YANDEX_API_KEY и YANDEX_FOLDER_ID обязательны');
   process.exit(1);
@@ -239,13 +240,22 @@ async function optionalAuth(req, res, next) {
 // ═══════════════════════════════════════════════════════════════
 // HEALTH CHECK
 // ═══════════════════════════════════════════════════════════════
-app.get('/api/health', (req, res) => {
+app.get('/api/health', async (req, res) => {
+  let dbConnected = false;
+  if (pool) {
+    try {
+      await pool.query('SELECT 1');
+      dbConnected = true;
+    } catch (e) {
+      console.error('Health check DB error:', e.message);
+    }
+  }
   res.json({ 
     status: 'ok', 
     timestamp: new Date().toISOString(), 
     version: '9.2.0', 
     api: 'YandexGPT + Unsplash',
-    db: !!pool,
+    db: dbConnected,
     uptime: process.uptime()
   });
 });
@@ -267,12 +277,11 @@ app.post('/api/auth/register', async (req, res) => {
     if (existing.rows.length > 0) return res.status(409).json({ error: 'Email уже используется' });
 
     const passwordHash = await bcrypt.hash(password, 12);
-    const verificationToken = crypto.randomBytes(32).toString('hex');
 
     const result = await pool.query(
-      `INSERT INTO users (email, password_hash, name, verification_token, free_generations_left, monthly_generations_left, last_reset_date)
-       VALUES ($1, $2, $3, $4, 5, 5, NOW()) RETURNING id, email, name`,
-      [email.toLowerCase(), passwordHash, name || email.split('@')[0], verificationToken]
+      `INSERT INTO users (email, password_hash, name, free_generations_left, monthly_generations_left, last_reset_date)
+       VALUES ($1, $2, $3, 5, 5, NOW()) RETURNING id, email, name`,
+      [email.toLowerCase(), passwordHash, name || email.split('@')[0]]
     );
 
     const user = result.rows[0];
@@ -503,7 +512,7 @@ app.post('/api/generate', optionalAuth, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// LESSON PLAN GENERATE (ИСПРАВЛЕННЫЙ)
+// LESSON PLAN GENERATE
 // ═══════════════════════════════════════════════════════════════
 app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
   try {
@@ -548,7 +557,6 @@ app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
     
     if (!lessonData.slides) lessonData.slides = [];
     
-    // ИСПРАВЛЕНИЕ: ПРЕВРАЩАЕМ STRING В ARRAY
     lessonData.slides = lessonData.slides.map(slide => {
       if (typeof slide.content === 'string') {
         slide.content = [slide.content];
@@ -631,7 +639,6 @@ app.post('/api/quiz/from-presentation', optionalAuth, async (req, res) => {
       return res.status(402).json({ error: 'Бесплатные генерации закончились', needPayment: true });
     }
 
-    const slidesText = slides.map(s => typeof s === 'string' ? s : (s.content?.join(' ') || s.title || '')).join('\n').substring(0, 3000);
     const prompt = `На основе презентации "${title}" создай тест из ${qCount} вопросов. Верни JSON.`;
     const response = await axios.post(YANDEX_URL, {
       modelUri: `gpt://${YANDEX_FOLDER_ID}/yandexgpt/latest`,
@@ -657,7 +664,7 @@ app.post('/api/quiz/from-presentation', optionalAuth, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// REPORT GENERATE (ИСПРАВЛЕННЫЙ)
+// REPORT GENERATE
 // ═══════════════════════════════════════════════════════════════
 app.post('/api/report/generate', optionalAuth, async (req, res) => {
   try {
@@ -702,7 +709,6 @@ app.post('/api/report/generate', optionalAuth, async (req, res) => {
     
     if (!reportData.slides) reportData.slides = [];
     
-    // ИСПРАВЛЕНИЕ: ПРЕВРАЩАЕМ STRING В ARRAY
     reportData.slides = reportData.slides.map(slide => {
       if (typeof slide.content === 'string') {
         slide.content = [slide.content];
@@ -929,7 +935,6 @@ app.post('/api/vip/activate', optionalAuth, async (req, res) => {
       return res.json({ success: true, message: 'VIP activated (demo)' });
     }
     
-    // Проверяем, сколько уже занято VIP-мест
     const countResult = await pool.query(
       'SELECT COUNT(*) as occupied FROM users WHERE is_vip = TRUE'
     );
@@ -939,14 +944,12 @@ app.post('/api/vip/activate', optionalAuth, async (req, res) => {
       return res.status(400).json({ error: 'All VIP spots are taken' });
     }
     
-    // Проверяем, не является ли пользователь уже VIP
     if (user.is_vip) {
       return res.status(400).json({ error: 'You are already a VIP member' });
     }
     
-    // Активируем VIP
     const expiry = new Date();
-    expiry.setFullYear(expiry.getFullYear() + 10); // на 10 лет
+    expiry.setFullYear(expiry.getFullYear() + 10);
     
     await pool.query(
       `UPDATE users 
@@ -977,13 +980,17 @@ app.post('/api/vip/activate', optionalAuth, async (req, res) => {
 // INIT DATABASE
 // ═══════════════════════════════════════════════════════════════
 async function initDatabase() {
-  if (!pool) return;
+  if (!pool) {
+    console.log('⚠️ База данных не настроена, работаем в DEMO режиме');
+    return;
+  }
   try {
+    await pool.query('SELECT 1');
+    console.log('✅ База данных подключена');
+    
     await pool.query(`
-      CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
-      
       CREATE TABLE IF NOT EXISTS users (
-        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         email VARCHAR(255) UNIQUE NOT NULL,
         password_hash VARCHAR(255),
         name VARCHAR(255),
@@ -999,7 +1006,7 @@ async function initDatabase() {
       );
       
       CREATE TABLE IF NOT EXISTS sessions (
-        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         user_id UUID REFERENCES users(id) ON DELETE CASCADE,
         token_hash VARCHAR(255) UNIQUE NOT NULL,
         expires_at TIMESTAMPTZ NOT NULL,
@@ -1010,7 +1017,7 @@ async function initDatabase() {
       CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
       
       CREATE TABLE IF NOT EXISTS generation_history (
-        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         user_id UUID REFERENCES users(id) ON DELETE CASCADE,
         type VARCHAR(50) NOT NULL,
         title VARCHAR(500) NOT NULL,
@@ -1031,13 +1038,6 @@ async function initDatabase() {
         is_active BOOLEAN DEFAULT TRUE,
         created_at TIMESTAMP DEFAULT NOW()
       );
-      
-      CREATE TABLE IF NOT EXISTS promocode_usages (
-        id SERIAL PRIMARY KEY,
-        promocode_id INT REFERENCES promocodes(id),
-        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-        used_at TIMESTAMP DEFAULT NOW()
-      );
     `);
     console.log('✅ Tables created');
     
@@ -1049,10 +1049,11 @@ async function initDatabase() {
     `);
     console.log('✅ Promocodes inserted');
   } catch (e) { 
-    console.error('Database init error:', e.message); 
+    console.error('❌ Database init error:', e.message); 
   }
 }
 
+// ЗАПУСК СЕРВЕРА
 initDatabase().then(() => {
   app.listen(PORT, () => {
     console.log(`🚀 Server on port ${PORT}`);
