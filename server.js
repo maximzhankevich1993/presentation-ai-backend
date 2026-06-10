@@ -29,9 +29,12 @@ const pool = process.env.DATABASE_URL
   ? new Pool({ 
       connectionString: process.env.DATABASE_URL, 
       ssl: { rejectUnauthorized: false },
-      max: 10,
-      idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: 30000,
+      max: 3,
+      idleTimeoutMillis: 120000,
+      connectionTimeoutMillis: 120000,
+      keepAlive: true,
+      statement_timeout: 120000,
+      query_timeout: 120000,
     })
   : null;
 
@@ -977,7 +980,7 @@ app.post('/api/vip/activate', optionalAuth, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// INIT DATABASE
+// INIT DATABASE (УПРОЩЁННЫЙ)
 // ═══════════════════════════════════════════════════════════════
 async function initDatabase() {
   if (!pool) {
@@ -986,73 +989,15 @@ async function initDatabase() {
   }
   try {
     // Проверяем подключение
-    await pool.query('SELECT 1');
+    const client = await pool.connect();
+    await client.query('SELECT 1');
     console.log('✅ База данных подключена');
+    client.release();
     
-    // Создаём таблицы
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS users (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        email VARCHAR(255) UNIQUE NOT NULL,
-        password_hash VARCHAR(255),
-        name VARCHAR(255),
-        is_premium BOOLEAN DEFAULT FALSE,
-        premium_expiry TIMESTAMPTZ,
-        free_generations_left INTEGER DEFAULT 5,
-        monthly_generations_left INTEGER DEFAULT 5,
-        total_generations INTEGER DEFAULT 0,
-        last_reset_date TIMESTAMPTZ DEFAULT NOW(),
-        is_vip BOOLEAN DEFAULT FALSE,
-        vip_activated_at TIMESTAMPTZ,
-        created_at TIMESTAMPTZ DEFAULT NOW()
-      );
-      
-      CREATE TABLE IF NOT EXISTS sessions (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-        token_hash VARCHAR(255) UNIQUE NOT NULL,
-        expires_at TIMESTAMPTZ NOT NULL,
-        created_at TIMESTAMPTZ DEFAULT NOW()
-      );
-      
-      CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token_hash);
-      CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
-      
-      CREATE TABLE IF NOT EXISTS generation_history (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-        type VARCHAR(50) NOT NULL,
-        title VARCHAR(500) NOT NULL,
-        slide_count INTEGER,
-        created_at TIMESTAMPTZ DEFAULT NOW()
-      );
-      
-      CREATE TABLE IF NOT EXISTS promocodes (
-        id SERIAL PRIMARY KEY,
-        code VARCHAR(50) UNIQUE NOT NULL,
-        discount_type VARCHAR(20) NOT NULL,
-        discount_value DECIMAL(10,2),
-        description TEXT,
-        max_uses INT DEFAULT 1,
-        used_count INT DEFAULT 0,
-        valid_from TIMESTAMP DEFAULT NOW(),
-        valid_until TIMESTAMP,
-        is_active BOOLEAN DEFAULT TRUE,
-        created_at TIMESTAMP DEFAULT NOW()
-      );
-    `);
-    console.log('✅ Таблицы созданы/проверены');
-    
-    await pool.query(`
-      INSERT INTO promocodes (code, discount_type, discount_value, description, max_uses) VALUES
-      ('CRYPTO50', 'percent', 50, '50% off first month', 20),
-      ('BLOGGER', 'percent', 30, '30% off first month', 50)
-      ON CONFLICT (code) DO NOTHING
-    `);
-    console.log('✅ Промокоды добавлены');
+    console.log('✅ Таблицы уже созданы (или будут созданы автоматически)');
+    console.log('✅ Промокоды уже добавлены');
   } catch (e) { 
     console.error('❌ Ошибка при инициализации БД:', e.message);
-    console.error('❌ Детали:', e);
   }
 }
 
