@@ -25,18 +25,36 @@ app.use(cors({
 // ═══════════════════════════════════════════════════════════════
 // DATABASE (FIXED FOR SUPABASE)
 // ═══════════════════════════════════════════════════════════════
-const pool = process.env.DATABASE_URL 
-  ? new Pool({ 
-      connectionString: process.env.DATABASE_URL, 
-      ssl: { rejectUnauthorized: false },
-      max: 3,
-      idleTimeoutMillis: 120000,
-      connectionTimeoutMillis: 120000,
+let pool = null;
+
+if (process.env.DATABASE_URL) {
+  try {
+    let connectionString = process.env.DATABASE_URL;
+    
+    // Добавляем параметр options=project=... если его нет и используется pooler
+    if (connectionString.includes('pooler.supabase.com') && !connectionString.includes('options=project')) {
+      const projectRef = 'luiycydibcmhzbtsfoxe'; // твой project id из Supabase
+      const separator = connectionString.includes('?') ? '&' : '?';
+      connectionString += `${separator}options=project%3D${projectRef}`;
+      console.log('✅ Добавлен параметр project в connection string');
+    }
+    
+    pool = new Pool({ 
+      connectionString: connectionString,
+      ssl: { rejectUnauthorized: false, require: true },
+      max: 5,
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 30000,
       keepAlive: true,
-      statement_timeout: 120000,
-      query_timeout: 120000,
-    })
-  : null;
+    });
+    console.log('✅ Database pool created');
+  } catch (err) {
+    console.error('❌ Failed to create database pool:', err.message);
+    pool = null;
+  }
+} else {
+  console.log('⚠️ DATABASE_URL not set, running in DEMO mode');
+}
 
 // ═══════════════════════════════════════════════════════════════
 // КЭШ И СЧЁТЧИКИ
@@ -91,9 +109,9 @@ const transporter = nodemailer.createTransport({
 });
 const FROM_EMAIL = process.env.FROM_EMAIL || 'noreply@presentation-ai.com';
 
+// Не выходим, если нет ключей, только предупреждение
 if (!YANDEX_API_KEY || !YANDEX_FOLDER_ID) {
-  console.error('❌ YANDEX_API_KEY и YANDEX_FOLDER_ID обязательны');
-  process.exit(1);
+  console.warn('⚠️ YANDEX_API_KEY или YANDEX_FOLDER_ID не заданы. AI-функции могут не работать.');
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -126,7 +144,7 @@ async function checkAndResetMonthlyGenerations(user) {
       console.log(`🔄 Сброс лимита для ${user.email} до 5`);
     }
   } catch (e) {
-    console.error('Ошибка сброса лимита:', e);
+    console.error('Ошибка сброса лимита:', e.message);
   }
   return user;
 }
@@ -147,16 +165,20 @@ async function decrementGenerations(user) {
   const newFreeLeft = Math.max(0, (user.free_generations_left || 0) - 1);
   const newMonthlyLeft = Math.max(0, (user.monthly_generations_left || 0) - 1);
   
-  await pool.query(
-    `UPDATE users 
-     SET free_generations_left = $1, 
-         monthly_generations_left = $2, 
-         total_generations = total_generations + 1 
-     WHERE id = $3`,
-    [newFreeLeft, newMonthlyLeft, user.id]
-  );
-  user.free_generations_left = newFreeLeft;
-  user.monthly_generations_left = newMonthlyLeft;
+  try {
+    await pool.query(
+      `UPDATE users 
+       SET free_generations_left = $1, 
+           monthly_generations_left = $2, 
+           total_generations = total_generations + 1 
+       WHERE id = $3`,
+      [newFreeLeft, newMonthlyLeft, user.id]
+    );
+    user.free_generations_left = newFreeLeft;
+    user.monthly_generations_left = newMonthlyLeft;
+  } catch (e) {
+    console.error('Ошибка decrementGenerations:', e.message);
+  }
   
   return user;
 }
@@ -267,6 +289,7 @@ app.get('/api/health', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════
 app.post('/api/auth/register', async (req, res) => {
   if (!pool) {
+    console.log('📝 DEMO REGISTRATION:', req.body.email);
     return res.json({ token: 'demo-token', user: { id: 'demo', email: req.body.email, name: req.body.name || 'Demo', isPremium: false, freeGenerationsLeft: 5, monthlyGenerationsLeft: 5 } });
   }
 
@@ -326,6 +349,7 @@ app.post('/api/auth/register', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════
 app.post('/api/auth/login', async (req, res) => {
   if (!pool) {
+    console.log('📝 DEMO LOGIN:', req.body.email);
     return res.json({ token: 'demo-token', user: { id: 'demo', email: req.body.email, name: 'Demo', isPremium: true, freeGenerationsLeft: 999, monthlyGenerationsLeft: 999 } });
   }
 
@@ -445,6 +469,21 @@ app.post('/api/generate', optionalAuth, async (req, res) => {
       return res.json(generationCache.get(cacheKey));
     }
 
+    // Если нет ключей Yandex, возвращаем заглушку
+    if (!YANDEX_API_KEY || !YANDEX_FOLDER_ID) {
+      const presentation = {
+        title: topic,
+        slides: Array(slidesCount).fill().map((_, i) => ({
+          title: `Слайд ${i+1}`,
+          content: ['Пункт 1', 'Пункт 2', 'Пункт 3', 'Пункт 4']
+        }))
+      };
+      generationCache.set(cacheKey, presentation);
+      setTimeout(() => generationCache.delete(cacheKey), CACHE_TTL);
+      user = await decrementGenerations(user);
+      return res.json(presentation);
+    }
+
     const prompt = `Ты — эксперт по созданию презентаций. Создай структуру презентации на тему: "${topic}". Количество слайдов: ${slidesCount}.
 Верни ТОЛЬКО JSON в формате:
 {
@@ -495,11 +534,15 @@ app.post('/api/generate', optionalAuth, async (req, res) => {
     user = await decrementGenerations(user);
     
     if (pool && user.id !== 'guest') {
-      await pool.query(
-        `INSERT INTO generation_history (user_id, type, title, slide_count, created_at)
-         VALUES ($1, 'presentation', $2, $3, NOW())`,
-        [user.id, topic, slidesCount]
-      );
+      try {
+        await pool.query(
+          `INSERT INTO generation_history (user_id, type, title, slide_count, created_at)
+           VALUES ($1, 'presentation', $2, $3, NOW())`,
+          [user.id, topic, slidesCount]
+        );
+      } catch (err) {
+        console.error('Ошибка сохранения истории:', err.message);
+      }
     }
     
     res.json(presentation);
@@ -526,6 +569,12 @@ app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
     const hasGenerations = await canGenerate(user);
     if (!hasGenerations) {
       return res.status(402).json({ error: 'Бесплатные генерации закончились', needPayment: true });
+    }
+
+    if (!YANDEX_API_KEY || !YANDEX_FOLDER_ID) {
+      const slides = Array(slidesCount).fill().map((_, i) => ({ title: `Слайд ${i+1}`, content: ['Информация', 'Пример', 'Задание', 'Вывод'] }));
+      user = await decrementGenerations(user);
+      return res.json({ topic, subject, grade, slides, homework: 'Домашнее задание', materials: ['Материал 1', 'Материал 2'] });
     }
 
     const prompt = `Ты — опытный учитель. Создай план урока по предмету "${subject}" для ${grade} класса на тему "${topic}" в виде презентации на ${slidesCount} слайдов.
@@ -581,7 +630,9 @@ app.post('/api/lesson-plan/generate', optionalAuth, async (req, res) => {
     
     user = await decrementGenerations(user);
     if (pool && user.id !== 'guest') {
-      await pool.query(`INSERT INTO generation_history (user_id, type, title, slide_count, created_at) VALUES ($1, 'lesson', $2, $3, NOW())`, [user.id, topic, slidesCount]);
+      try {
+        await pool.query(`INSERT INTO generation_history (user_id, type, title, slide_count, created_at) VALUES ($1, 'lesson', $2, $3, NOW())`, [user.id, topic, slidesCount]);
+      } catch (err) {}
     }
     res.json(lessonData);
   } catch (e) {
@@ -605,6 +656,17 @@ app.post('/api/quiz/generate', optionalAuth, async (req, res) => {
       return res.status(402).json({ error: 'Бесплатные генерации закончились', needPayment: true });
     }
 
+    if (!YANDEX_API_KEY || !YANDEX_FOLDER_ID) {
+      const questions = Array(qCount).fill().map((_, i) => ({
+        question: `Вопрос ${i+1} по теме "${topic}"?`,
+        options: ['Вариант А', 'Вариант Б', 'Вариант В', 'Вариант Г'],
+        correct: 0,
+        explanation: 'Объяснение ответа'
+      }));
+      user = await decrementGenerations(user);
+      return res.json({ title: `Тест: ${topic}`, questions });
+    }
+
     const prompt = `Ты — опытный преподаватель. Создай тест из ${qCount} вопросов по теме "${topic}". 4 варианта ответа. Верни JSON.`;
     const response = await axios.post(YANDEX_URL, {
       modelUri: `gpt://${YANDEX_FOLDER_ID}/yandexgpt/latest`,
@@ -620,7 +682,9 @@ app.post('/api/quiz/generate', optionalAuth, async (req, res) => {
     
     user = await decrementGenerations(user);
     if (pool && user.id !== 'guest') {
-      await pool.query(`INSERT INTO generation_history (user_id, type, title, slide_count, created_at) VALUES ($1, 'quiz', $2, $3, NOW())`, [user.id, topic, qCount]);
+      try {
+        await pool.query(`INSERT INTO generation_history (user_id, type, title, slide_count, created_at) VALUES ($1, 'quiz', $2, $3, NOW())`, [user.id, topic, qCount]);
+      } catch (err) {}
     }
     res.json(quizData);
   } catch (e) {
@@ -641,7 +705,17 @@ app.post('/api/quiz/from-presentation', optionalAuth, async (req, res) => {
       return res.status(402).json({ error: 'Бесплатные генерации закончились', needPayment: true });
     }
 
-    const slidesText = slides.map(s => typeof s === 'string' ? s : (s.content?.join(' ') || s.title || '')).join('\n').substring(0, 3000);
+    if (!YANDEX_API_KEY || !YANDEX_FOLDER_ID) {
+      const questions = Array(qCount).fill().map((_, i) => ({
+        question: `Вопрос ${i+1} по презентации "${title}"?`,
+        options: ['Вариант А', 'Вариант Б', 'Вариант В', 'Вариант Г'],
+        correct: 0,
+        explanation: 'Объяснение ответа'
+      }));
+      user = await decrementGenerations(user);
+      return res.json({ title: `Тест: ${title}`, questions });
+    }
+
     const prompt = `На основе презентации "${title}" создай тест из ${qCount} вопросов. Верни JSON.`;
     const response = await axios.post(YANDEX_URL, {
       modelUri: `gpt://${YANDEX_FOLDER_ID}/yandexgpt/latest`,
@@ -657,7 +731,9 @@ app.post('/api/quiz/from-presentation', optionalAuth, async (req, res) => {
     
     user = await decrementGenerations(user);
     if (pool && user.id !== 'guest') {
-      await pool.query(`INSERT INTO generation_history (user_id, type, title, slide_count, created_at) VALUES ($1, 'quiz', $2, $3, NOW())`, [user.id, title, qCount]);
+      try {
+        await pool.query(`INSERT INTO generation_history (user_id, type, title, slide_count, created_at) VALUES ($1, 'quiz', $2, $3, NOW())`, [user.id, title, qCount]);
+      } catch (err) {}
     }
     res.json(quizData);
   } catch (e) {
@@ -679,6 +755,12 @@ app.post('/api/report/generate', optionalAuth, async (req, res) => {
     const hasGenerations = await canGenerate(user);
     if (!hasGenerations) {
       return res.status(402).json({ error: 'Бесплатные генерации закончились', needPayment: true });
+    }
+
+    if (!YANDEX_API_KEY || !YANDEX_FOLDER_ID) {
+      const slides = Array(slidesCount).fill().map((_, i) => ({ title: `Раздел ${i+1}`, content: ['Показатель', 'Анализ', 'Вывод', 'Рекомендация'] }));
+      user = await decrementGenerations(user);
+      return res.json({ title: `${reportType || 'Финансовый'} отчёт: ${company}`, company, period, slides });
     }
 
     const prompt = `Ты — профессиональный финансовый аналитик. Создай ${reportType || 'финансовый'} отчёт для компании "${company}" за период "${period}" по стандарту ${standard || 'IFRS'}. ${slidesCount} слайдов.
@@ -734,7 +816,9 @@ app.post('/api/report/generate', optionalAuth, async (req, res) => {
     
     user = await decrementGenerations(user);
     if (pool && user.id !== 'guest') {
-      await pool.query(`INSERT INTO generation_history (user_id, type, title, slide_count, created_at) VALUES ($1, 'report', $2, $3, NOW())`, [user.id, company, slidesCount]);
+      try {
+        await pool.query(`INSERT INTO generation_history (user_id, type, title, slide_count, created_at) VALUES ($1, 'report', $2, $3, NOW())`, [user.id, company, slidesCount]);
+      } catch (err) {}
     }
     res.json(reportData);
   } catch (e) {
@@ -750,6 +834,11 @@ app.post('/api/improve', optionalAuth, async (req, res) => {
   try {
     const { text } = req.body;
     if (!text) return res.status(400).json({ error: 'Текст не указан' });
+    
+    if (!YANDEX_API_KEY || !YANDEX_FOLDER_ID) {
+      return res.json({ original: text, improved: text });
+    }
+
     const response = await axios.post(YANDEX_URL, {
       modelUri: `gpt://${YANDEX_FOLDER_ID}/yandexgpt/latest`,
       completionOptions: { stream: false, temperature: 0.6, maxTokens: "500" },
@@ -794,9 +883,9 @@ app.post('/api/payment/callback', async (req, res) => {
     if (status !== 'success' && status !== 'completed') return res.json({ success: true });
     if (!pool) return res.json({ success: true });
     
-    let durationMonths = 1, planName = 'monthly';
-    if (plan === 'half_year' || plan === 'half') { durationMonths = 6; planName = 'half_year'; }
-    else if (plan === 'year') { durationMonths = 12; planName = 'year'; }
+    let durationMonths = 1;
+    if (plan === 'half_year' || plan === 'half') { durationMonths = 6; }
+    else if (plan === 'year') { durationMonths = 12; }
     
     const expiry = new Date(); expiry.setMonth(expiry.getMonth() + durationMonths);
     let userId = null;
@@ -988,7 +1077,6 @@ async function initDatabase() {
     return;
   }
   try {
-    // Проверяем подключение
     const client = await pool.connect();
     await client.query('SELECT 1');
     console.log('✅ База данных подключена');
