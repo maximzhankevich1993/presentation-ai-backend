@@ -23,7 +23,7 @@ app.use(cors({
 }));
 
 // ═══════════════════════════════════════════════════════════════
-// DATABASE (FIXED FOR SUPABASE)
+// DATABASE (FIXED FOR SUPABASE - SSL DISABLED)
 // ═══════════════════════════════════════════════════════════════
 let pool = null;
 
@@ -31,17 +31,20 @@ if (process.env.DATABASE_URL) {
   try {
     let connectionString = process.env.DATABASE_URL;
     
-    // Добавляем параметр options=project=... если его нет и используется pooler
+    // Добавляем параметр sslmode=disable в строку
+    const separator = connectionString.includes('?') ? '&' : '?';
+    connectionString += `${separator}sslmode=disable`;
+    
+    // Добавляем параметр options=project если используется pooler
     if (connectionString.includes('pooler.supabase.com') && !connectionString.includes('options=project')) {
       const projectRef = 'luiycydibcmhzbtsfoxe';
-      const separator = connectionString.includes('?') ? '&' : '?';
-      connectionString += `${separator}options=project%3D${projectRef}`;
+      connectionString += `&options=project%3D${projectRef}`;
       console.log('✅ Добавлен параметр project в connection string');
     }
     
     pool = new Pool({ 
       connectionString: connectionString,
-      ssl: { rejectUnauthorized: false },  // Убрали require: true
+      ssl: { rejectUnauthorized: false, ca: null, key: null, cert: null },
       max: 5,
       idleTimeoutMillis: 30000,
       connectionTimeoutMillis: 30000,
