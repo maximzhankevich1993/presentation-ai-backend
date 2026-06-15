@@ -33,7 +33,7 @@ if (process.env.DATABASE_URL) {
     
     // Добавляем параметр options=project=... если его нет и используется pooler
     if (connectionString.includes('pooler.supabase.com') && !connectionString.includes('options=project')) {
-      const projectRef = 'luiycydibcmhzbtsfoxe'; // твой project id из Supabase
+      const projectRef = 'luiycydibcmhzbtsfoxe';
       const separator = connectionString.includes('?') ? '&' : '?';
       connectionString += `${separator}options=project%3D${projectRef}`;
       console.log('✅ Добавлен параметр project в connection string');
@@ -41,7 +41,7 @@ if (process.env.DATABASE_URL) {
     
     pool = new Pool({ 
       connectionString: connectionString,
-      ssl: { rejectUnauthorized: false, require: true },
+      ssl: { rejectUnauthorized: false },  // Убрали require: true
       max: 5,
       idleTimeoutMillis: 30000,
       connectionTimeoutMillis: 30000,
